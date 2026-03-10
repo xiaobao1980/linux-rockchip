@@ -454,3 +454,4 @@ config BT_HCIBTUSB_RTLBTUSB
 	  kernel or say M to compile it as module (rtk_btusb).
 
 endmenu
+source "drivers/bluetooth/skwbt/Kconfig"
