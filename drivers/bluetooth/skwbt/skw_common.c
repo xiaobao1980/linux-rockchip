@@ -13,9 +13,6 @@
 #include <linux/version.h>
 #include <linux/time.h>
 #include <linux/err.h>
-#include <linux/proc_fs.h>
-#include <linux/skbuff.h>
-#include <linux/kernel.h>
 
 #include "skw_common.h"
 #include "skw_btsnoop.h"
@@ -33,16 +30,15 @@
 #endif
 
 #define BD_ADDR_FILE_PATH "/devinfo/skwbt"
-
+//typedef unsigned long mm_segment_t;
 
 static unsigned char bdaddr_lap[4] = {0x12, 0x24, 0x56};
 static char bdaddr_valid = 0;
 static unsigned int randseed;
 
 
-#ifdef FILE_RW_ENABLE
 
-
+#if 0
 mm_segment_t skwbt_get_fs(void)
 {
     mm_segment_t oldfs;
@@ -65,41 +61,35 @@ void skwbt_set_fs(mm_segment_t fs)
 #endif
 
 }
-
 #endif
 
 ssize_t skw_file_write(struct file *fp, const void *buf, size_t len)
 {
-#ifdef FILE_RW_ENABLE
     ssize_t res_len = 0;
     loff_t pos = fp->f_pos;
-    mm_segment_t fs = skwbt_get_fs();
+    //mm_segment_t fs = skwbt_get_fs();
+#ifdef FILE_RW_ENABLE
     res_len = skw_write(fp, buf, len, &pos);
+#endif
     fp->f_pos = pos;
-    skwbt_set_fs(fs);
+    //skwbt_set_fs(fs);
 
     return res_len;
-#else
-	return 0;
-#endif
-	
 }
 EXPORT_SYMBOL_GPL(skw_file_write);
 
 
 ssize_t skw_file_read(struct file *fp, void *buf, size_t len)
 {
-#ifdef FILE_RW_ENABLE
     ssize_t res_len = 0;
     loff_t pos = fp->f_pos;
-    mm_segment_t fs = skwbt_get_fs();
+    //mm_segment_t fs = skwbt_get_fs();
+#ifdef FILE_RW_ENABLE
     res_len = skw_read(fp, buf, len, &pos);
-    fp->f_pos = pos;
-    skwbt_set_fs(fs);
-    return res_len;
-#else
-	return 0;
 #endif
+    fp->f_pos = pos;
+    //skwbt_set_fs(fs);
+    return res_len;
 }
 EXPORT_SYMBOL_GPL(skw_file_read);
 
@@ -261,7 +251,6 @@ int skw_strlen(char *str)
     }
     return str_len;
 }
-EXPORT_SYMBOL_GPL(skw_strlen);
 
 unsigned char skw_char2hex(char ch)
 {
@@ -280,7 +269,6 @@ unsigned char skw_char2hex(char ch)
     }
     return num;
 }
-EXPORT_SYMBOL_GPL(skw_char2hex);
 
 
 /*

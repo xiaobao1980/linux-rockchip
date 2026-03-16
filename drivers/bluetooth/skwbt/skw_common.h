@@ -139,8 +139,6 @@ void skw_bd_addr_gen_init(void);
 
 char skw_get_bd_addr(unsigned char *buffer);
 
-int skw_strlen(char *str);
 
-unsigned char skw_char2hex(char ch);
 
 #endif

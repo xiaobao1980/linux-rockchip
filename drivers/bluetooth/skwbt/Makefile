@@ -9,18 +9,13 @@ ifneq ($(skw_extra_flags),)
 ccflags-y += $(skw_extra_flags)
 endif
 
-ifneq ($(skw_extra_symbols),)
-KBUILD_EXTRA_SYMBOLS += $(skw_extra_symbols)
-endif
-
-#ifeq ($(CONFIG_SEEKWAVE_BSP_DRIVERS_V20),y)
-    ccflags-y += -DINCLUDE_NEW_VERSION=1
-#endif
-
-ifeq ($(CONFIG_SEEKWAVE_PLD_RELEASE),y)
+ifeq ($(CONFIG_SEEKWAVE_PLD_RELEASE),m)
     ccflags-y += -DCONFIG_SEEKWAVE_PLD_RELEASE
 endif
 
+ifeq ($(CONFIG_SEEKWAVE_BSP_DRIVERS_V20),y)
+    ccflags-y += -DINCLUDE_NEW_VERSION=1
+endif
 
 obj-$(CONFIG_SKW_BT)        += skwbt.o
 skwbt-y                     := skw_btdriver.o
