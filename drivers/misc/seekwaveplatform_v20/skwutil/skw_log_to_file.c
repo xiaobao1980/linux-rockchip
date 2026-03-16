@@ -49,11 +49,7 @@ int skw_log_size = (1*1024*1024);
 int skw_log_size = (100*1024*1024);
 #endif
 #define SKW_LOG_READ_BUFFER_SIZE (8*1024)
-
-#ifndef CONFIG_NO_GKI
-#define CONFIG_NO_GKI
-#endif
-
+//#define CONFIG_NO_GKI
 module_param(skw_log_size, int, 0644);
 module_param(skw_log_num, int, 0644);
 
@@ -110,8 +106,12 @@ static void skw_modem_log_to_file_work(struct work_struct *data);
 #ifdef CONFIG_NO_GKI
 static int skw_modem_save_dumpmem(void);
 static void skw_modem_dumpmodem_start_rec(void);
+static void skw_modem_dumpmodem_stop_rec(void);
 #endif
 static uint32_t record_flag = 0;
+#ifdef CONFIG_NO_GKI
+static uint32_t dumpmodem_flag = 0;
+#endif
 static uint32_t cp_assert_status = 0;
 #ifdef CONFIG_NO_GKI
 static struct file *log_fp = NULL;
@@ -179,6 +179,7 @@ static int modem_event_notifier(struct notifier_block *nb, unsigned long action,
 		{
 			skwboot_log("the BSPREADY EVENT Comming in !!!!\n");
 			skw_modem_log_start_rec();
+			skw_modem_dumpmodem_stop_rec();
 		}
 		break;
 		case DEVICE_DUMPDONE_EVENT:
@@ -198,6 +199,8 @@ static int modem_event_notifier(struct notifier_block *nb, unsigned long action,
 		{
 			skwboot_log("the DUMP MEM EVENT Comming in !!!!\n");
 			skw_modem_dumpmodem_start_rec();
+			msleep(500);
+			skw_modem_dumpmodem_stop_rec();
 		}
 		break;
 		default:
@@ -246,6 +249,7 @@ static void skw_modem_log_to_file_work(struct work_struct *data)
 		kfree(log_file);
 		return;
 	}
+	log_read_buffer.lenth = 0;
 
 	sprintf(log_store, "%s/log_store", log_path);
 	log_store_fp = filp_open(log_store, O_RDWR, 0777);
@@ -304,71 +308,66 @@ static void skw_modem_log_to_file_work(struct work_struct *data)
 		fp = log_fp;
 	}
 	atomic_inc(&log_com->open);
-	if (atomic_read(&log_com->open)==1) {
-		init_waitqueue_head(&log_com->wq);
-		spin_lock_init(&log_com->lock);
-		log_com->pdata->open_port(log_com->portno, NULL, NULL);
-	}
+	spin_lock_init(&log_com->lock);
 
-	log_read_buffer.lenth = 0;
-	log_read_buffer.buffer = kzalloc(SKW_LOG_READ_BUFFER_SIZE, GFP_KERNEL);
-	if(!log_read_buffer.buffer){
-			kfree(log_store);
-			kfree(log_file);
-			return;
-	}
 	skwlog_log(" open %s for CP log record \n", log_file);
+	log_com->pdata->open_port(log_com->portno, NULL, NULL);
 	while(record_flag || cp_assert_status)
 	{
 		ret = 0;
+		if(log_com){
 check_rx_busy:
-		spin_lock_irqsave(&log_com->lock, flags);
-		if(log_com->rx_busy) {
+			spin_lock_irqsave(&log_com->lock, flags);
+			if(log_com->rx_busy) {
+				spin_unlock_irqrestore(&log_com->lock, flags);
+				mdelay(5);
+				goto check_rx_busy;
+			}
+			log_com->rx_busy = 1;
+			count = log_com->pdata->max_buffer_size;
 			spin_unlock_irqrestore(&log_com->lock, flags);
-			mdelay(5);
-			goto check_rx_busy;
-		}
-		log_com->rx_busy = 1;
-		count = log_com->pdata->max_buffer_size;
-		spin_unlock_irqrestore(&log_com->lock, flags);
-		ret = log_com->pdata->hw_sdma_rx(log_com->portno, (log_read_buffer.buffer + log_read_buffer.lenth), count);
-		if(ret > 0){
-			log_cnt++;
-			sdma_rx_error_cnt = 0;
-			log_read_buffer.lenth = log_read_buffer.lenth + ret;
-			//skwlog_log("hw_sdma_rx read len:%d buffer len:%d \n", ret, log_read_buffer.lenth);
-			if(ret >= 0x1000)
-				skwlog_err("%s get too long data , err:%d \n",__func__, ret);
-			if(log_cnt > 1000){
-				skwlog_log("%s log_file:%s offset:%lld data:0x%x 0x%x 0x%x 0x%x 0x%x	\n",__func__, log_file, offset, *(log_read_buffer.buffer),
-					*(log_read_buffer.buffer+1), *(log_read_buffer.buffer+2), *(log_read_buffer.buffer+3), *(log_read_buffer.buffer+4));
-				log_cnt = 0;
+			ret = log_com->pdata->hw_sdma_rx(log_com->portno, (log_read_buffer.buffer + log_read_buffer.lenth), count);
+			if(ret > 0){
+				log_cnt++;
+				sdma_rx_error_cnt = 0;
+				log_read_buffer.lenth = log_read_buffer.lenth + ret;
+				//skwlog_log("hw_sdma_rx read len:%d buffer len:%d \n", ret, log_read_buffer.lenth);
+				if(ret >= 0x1000)
+					skwlog_err("%s get too long data , err:%d \n",__func__, ret);
+
+				if(log_cnt > 1000){
+					skwlog_log("%s log_file:%s offset:%lld data:0x%x 0x%x 0x%x 0x%x 0x%x	\n",__func__, log_file, offset, *(log_read_buffer.buffer),
+						*(log_read_buffer.buffer+1), *(log_read_buffer.buffer+2), *(log_read_buffer.buffer+3), *(log_read_buffer.buffer+4));
+					log_cnt = 0;
+				}
 			}
-		} else {
-			skwlog_err("%s read log data err:%d \n",__func__, ret);
-			sdma_rx_error_cnt++;
-			if(sdma_rx_error_cnt > 5){
-				skwlog_err("%s sdma_rx_error_cnt over:%d, stop log work \n",__func__, sdma_rx_error_cnt);
-				skw_modem_log_set_assert_status(0);
-				skw_modem_log_stop_rec();
+			else{
+				skwlog_err("%s read log data err:%d \n",__func__, ret);
+				sdma_rx_error_cnt++;
+				if(sdma_rx_error_cnt > 5){
+					skwlog_err("%s sdma_rx_error_cnt over:%d, stop log work \n",__func__, sdma_rx_error_cnt);
+					skw_modem_log_set_assert_status(0);
+					skw_modem_log_stop_rec();
+				}
 			}
-		}
-		if (port_data->bus_type == USB_LINK) {
-			if(ret < 0){
-				skwlog_err("%s read log data err:%d, stop log work \n",__func__, ret);
-				skw_modem_log_set_assert_status(0);
-				skw_modem_log_stop_rec();
+
+			if (port_data->bus_type == USB_LINK) {
+				if(ret < 0){
+					skwlog_err("%s read log data err:%d, stop log work \n",__func__, ret);
+					skw_modem_log_set_assert_status(0);
+					skw_modem_log_stop_rec();
+				}
 			}
-		}
-		else if (port_data->bus_type == SDIO_LINK) {
-			if(ret == -ENOTCONN){
-				skw_modem_log_set_assert_status(0);
-				skw_modem_log_stop_rec();
+			else if (port_data->bus_type == SDIO_LINK) {
+				if(ret == -ENOTCONN){
+					skw_modem_log_set_assert_status(0);
+					skw_modem_log_stop_rec();
+				}
 			}
+			//skwlog_log("read log from SDIO len:%d  ----- \n", log_read_buffer.lenth);
+			log_com->rx_busy = 0;
+			rx_data = (uint32_t *)log_read_buffer.buffer;	
 		}
-		//skwlog_log("read log from SDIO len:%d  ----- \n", log_read_buffer.lenth);
-		log_com->rx_busy = 0;
-		rx_data = (uint32_t *)log_read_buffer.buffer;	
 
 		if(((log_read_buffer.lenth > 0) && cp_assert_status) 
 			|| ((SKW_LOG_READ_BUFFER_SIZE - log_read_buffer.lenth) <= (log_com->pdata->max_buffer_size))){
@@ -406,9 +405,6 @@ check_rx_busy:
 				fp = log_fp;
 				if(IS_ERR(fp)){
 					skwlog_err("%s switch record file to:%s failed: %d \n",__func__, log_file, (int)PTR_ERR(fp));
-					kfree(log_file);
-					kfree(log_store);
-					kfree(log_read_buffer.buffer);
 					return;
 				}
 				else{
@@ -442,7 +438,6 @@ check_rx_busy:
 	}
 	kfree(log_file);
 	kfree(log_store);
-	kfree(log_read_buffer.buffer);
 	skwlog_log("%s work exit\n",__func__);
 
 	return;
@@ -539,9 +534,6 @@ exit:
 static int skw_modem_save_dumpmem(void)
 {
 	int ret =0;
-
-	if (!log_com->pdata->skw_dump_mem)
-		return 0;
 	skwlog_log("The ------Enter ----\n");
 	//DATA MEM
 	ret = skw_modem_save_mem(skw_data_mem,DATA_MEM_SIZE, DATA_MEM_BASE_ADDR);
@@ -653,13 +645,20 @@ int skw_modem_log_init(struct sv6160_platform_data *p_data, struct file *fp, voi
 
 	int ret = 0;
 #ifdef CONFIG_NO_GKI
+	skwlog_log("%s enter  \n",__func__);
 	if (skw_log_dev)
 		return 0;
-	skwlog_log("%s enter  \n",__func__);
 	log_fp = fp;
 	log_com = ucom;
 	port_data = p_data;
 
+	log_read_buffer.lenth = 0;
+	log_read_buffer.buffer = kzalloc(SKW_LOG_READ_BUFFER_SIZE, GFP_KERNEL);
+	if(!log_read_buffer.buffer){
+		ret = -ENOMEM;
+		skwlog_err("%s can't malloc log_read_buffer,%d\n", __func__, __LINE__);
+		goto err1;
+	}
 	skw_log_dev = (struct skw_log_data *)kzalloc(sizeof(*skw_log_dev), GFP_KERNEL);
 	if (!skw_log_dev){
 		ret = -ENOMEM;
@@ -690,7 +689,7 @@ int skw_modem_log_init(struct sv6160_platform_data *p_data, struct file *fp, voi
 		goto err2;
 
 	skw_modem_log_start_rec();
-	return 1;
+	return 0;
 
 err2:
 	destroy_workqueue(skw_log_dev->wq);
@@ -743,6 +742,15 @@ void skw_modem_log_start_rec(void)
 static void skw_modem_dumpmodem_start_rec(void)
 {
 	skwlog_log("%s enter  \n",__func__);
+	if(!skw_log_dev){
+		skwlog_log("%s no mem ready, can't start \n",__func__);
+		return;
+	}
+	if(dumpmodem_flag){
+		skwlog_log("%s dump modem mem already start \n",__func__);
+		return;
+	}
+	dumpmodem_flag = 1;
 	skw_modem_save_dumpmem();
 }
 #endif
@@ -753,6 +761,18 @@ static void skw_modem_dumpmodem_start_rec(void)
  *Date:2022-11-14
  *Modify:
  **************************************************************************/
+#ifdef CONFIG_NO_GKI
+static void skw_modem_dumpmodem_stop_rec(void)
+{
+	skwlog_log("%s enter %d  \n",__func__, cp_assert_status);
+
+	if(dumpmodem_flag)
+		dumpmodem_flag = 0;
+
+	return;
+}
+#endif
+
 void skw_modem_log_stop_rec(void)
 {
 	skwlog_log("%s enter %d \n",__func__, cp_assert_status);
@@ -760,7 +780,7 @@ void skw_modem_log_stop_rec(void)
 	if(record_flag)
 		record_flag = 0;
 	if(log_com && log_com->pdata && log_com->pdata->close_port)
-		log_com->pdata->close_port(log_com->portno);	
+		log_com->pdata->close_port(log_com->portno);
 	return;
 }
 
@@ -771,12 +791,14 @@ void skw_modem_log_exit(void)
 	if(!log_com) return;
 	log_com->pdata->modem_unregister_notify(&log_com->notifier);
 	skw_modem_log_stop_rec();
-	cancel_work_sync(&skw_log_dev->log_to_file_work);
+	skw_modem_dumpmodem_stop_rec();
 	destroy_workqueue(skw_log_dev->wq);
 	skwlog_log("%s -----line %d ---enter  \n",__func__, __LINE__);
 	kfree(skw_log_dev);
 	skw_log_dev = NULL;
 	log_com = NULL;
+	if(log_read_buffer.buffer)
+		kfree(log_read_buffer.buffer);
 #endif
 }
 

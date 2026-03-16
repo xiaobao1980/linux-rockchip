@@ -10,9 +10,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-#include "asm-generic/int-ll64.h"
-#include "linux/compiler.h"
-#include "linux/gfp.h"
 #include <linux/platform_device.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/scatterlist.h>
@@ -35,20 +32,14 @@
 #include "skw_edma_drv.h"
 #include "trace.h"
 
-
-extern int cp_exception_sts;
 static u64 port_dmamask = DMA_BIT_MASK(32);
 struct edma_port edma_ports[MAX_PORT_NUM] = {0};
 static struct platform_device *wifi_data_pdev;
-#ifdef CONFIG_BT_SEEKWAVE
-static struct platform_device *bt_data_pdev;
-#endif
 char firmware_version[128];
 u32 last_sent_wifi_cmd[3];
 u32 port_sta_rec[32] = {0};
 u8 *at_buffer;
 char *bt_rx_buffer[4];
-char *port_state[] = {"IDLE", "OPEN", "CLOSE", "ASSERT", "BUSY"};
 
 extern int send_modem_assert_command(void);
 struct skw_channel_cfg edma_channels[MAX_EDMA_COUNT];
@@ -121,7 +112,7 @@ void skw_get_port_statistic(char *buffer, int size)
 		if(edma_ports[i].state)
 			ret += sprintf(&buffer[ret], "port%d: rx %d, tx  %d\n",
 					i,edma_ports[i].rx_size,edma_ports[i].tx_size);
-	}
+		}
 }
 
 static void edma_spin_lock_init(struct wcn_pcie_info *priv)
@@ -146,21 +137,13 @@ void *edma_coherent_rcvheader_to_cpuaddr(u64 rcv_pcie_addr, struct edma_chn_info
 	void *cpu_addr;
 
 	offset = rcv_pcie_addr - edma_chp->chn_cfg.header;
-	cpu_addr = (void *)((char *)edma_chp->hdr_virt_addr + 8 + offset);
+	cpu_addr = (void *)((char *)edma_chp->p_link_hdr + 8 + offset);
 	return cpu_addr;
 }
 
-u32 edma_clear_node_count(int channel)
+u32 edma_clear_src_node_count(int channel)
 {
-	u32 ret = 0;
-	struct edma_chn_info *edma_chp = get_edma_channel_info(channel);
-
-	if (edma_chp->chn_cfg.direction == EDMA_TX)
-		ret = skw_pcie_read32(DMA_SRC_INT_DSCR_HIGH(channel));
-	else
-		ret = skw_pcie_read32(DMA_DST_INT_DSCR_HIGH(channel));
-
-	return ret;
+	return skw_pcie_read32(DMA_SRC_INT_DSCR_HIGH(channel));
 }
 
 int edma_get_node_tot_cnt(int channel)
@@ -174,9 +157,15 @@ int edma_get_node_tot_cnt(int channel)
 
 static int inline is_legacy_irq_wifi_takeover(int ch_id)
 {
-#define SKW_EDMA_WIFI_CHANNELS_BITMAP      0x7FFC000   /* channel 14 - 26 */
-	return SKW_EDMA_WIFI_CHANNELS_BITMAP & BIT(ch_id);
+	if (ch_id == EDMA_WIFI_TX0_FREE_ADDR || ch_id == EDMA_WIFI_TX1_FREE_ADDR
+		|| ch_id == EDMA_WIFI_RX0_PKT_ADDR || ch_id == EDMA_WIFI_RX1_PKT_ADDR
+		|| ch_id == EDMA_WIFI_RX0_FILTER_DATA_CHN || ch_id == EDMA_WIFI_RX1_FILTER_DATA_CNH
+		|| ch_id == EDMA_WIFI_TX0_PACKET_ADDR || ch_id == EDMA_WIFI_TX1_PACKET_ADDR)
+		return 1;
+	else
+		return 0;
 }
+
 
 int legacy_edma_irq_handle(void)
 {
@@ -199,6 +188,7 @@ int legacy_edma_irq_handle(void)
 	status = skw_pcie_read32(DMA_INT_MASK_STS);
 
 	if (!status) {
+		//BUG_ON(1);
 		spin_unlock_irqrestore(priv->spin_lock, flags);
 		return 0;
 	}
@@ -209,11 +199,6 @@ int legacy_edma_irq_handle(void)
 			if (edma_chp->chn_cfg.direction == EDMA_TX) {//tx
 				reg_chn_src_int.u32 = skw_pcie_read32(DMA_SRC_INT(ch_id));
 				if (reg_chn_src_int.src_complete_mask_sts) {
-					if (is_legacy_irq_wifi_takeover(ch_id)) {
-						legacy_irq_wifi_takeover_handler(ch_id);
-						continue;
-					}
-
 					reg_chn_src_int.src_complete_int_clr = 1;
 					skw_pcie_write32(DMA_SRC_INT(ch_id), reg_chn_src_int.u32);
 					node_addr0.addr_l32 = skw_pcie_read32(DMA_SRC_INT_DSCR_HEAD_LOW(ch_id));
@@ -245,7 +230,6 @@ int legacy_edma_irq_handle(void)
 						legacy_irq_wifi_takeover_handler(ch_id);
 						continue;
 					}
-
 					reg_chn_dst_int.dst_complete_int_clr = 1;
 					skw_pcie_write32(DMA_DST_INT(ch_id), reg_chn_dst_int.u32);
 					node_addr0.addr_l32 = skw_pcie_read32(DMA_DST_INT_DSCR_HEAD_LOW(ch_id));
@@ -759,55 +743,26 @@ int edma_adma_send(int ch_id, struct scatterlist *sg, int node_cnt, int size)
 	//skw_edma_unlock();
 	return 0;
 }
-#if 0
-static int ch_alloc_coherent(struct edma_chn_info *edma_chp, int size)
+
+static int edma_port_read(struct edma_port *port, char *buffer, int size)
 {
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct device *dev = &(priv->dev->dev);
-
-	edma_chp->pld_virt_addr = dma_alloc_coherent(dev, size, &edma_chp->pld_dma_addr, GFP_KERNEL);
-	if (!edma_chp->pld_virt_addr) {
-		PCIE_ERR("Alloc ch %d tmpbuf fail\n", edma_chp->chn_id);
-		return -ENOMEM;
-	}
-	PCIE_DBG("ch %d alloc tmpbuf:0x%llx\n", edma_chp->chn_id, edma_chp->pld_dma_addr);
-	memset(edma_chp->pld_virt_addr, 0, size);
-
-	return 0;
-}
-
-static void ch_free_coherent(struct edma_chn_info *edma_chp, int size)
-{
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct device *dev = &(priv->dev->dev);
-
-	dma_free_coherent(dev, size, edma_chp->pld_virt_addr, edma_chp->pld_dma_addr);
-	PCIE_DBG("ch %d free tmpbuf:0x%llx\n", edma_chp->chn_id, edma_chp->pld_dma_addr);
-}
-#endif
-static noinline int edma_port_read(struct edma_port *port, char *buffer, int size)
-{
-	u8 ch_id = port->rx_ch;
 	struct wcn_pcie_info *priv= get_pcie_device_info();
-	struct edma_chn_info *edma_chp = get_edma_channel_info(ch_id);
+	struct device *dev = &(priv->dev->dev);
+	struct edma_chn_info *edma_chp;
 	EDMA_HDR_T *nodep = port->rx_node;
+	u8 ch_id = port->rx_ch;
 	int ret;
-
 	//mutex_lock(&port->rx_mutex);
-	PCIE_DBG("[+], port%d state=%s\n", port->portno, port_state[port->state]);
-	//edma_chp->n_pld_sz = size;
-	if (port->state != PORT_STATE_OPEN) {
-		PCIE_ERR("port%d is not open:%s, exit\n", port->portno, port_state[port->state]);
-		return -110;
-	}
-#if 0
-	ret = ch_alloc_coherent(edma_chp, size);
-	if (ret) {
-		PCIE_ERR("ch %d alloc coherent mem fail\n", ch_id);
-		return ret;
-	}
-#endif
-#if 0
+	PCIE_DBG("[+], portno=%d, port_state=%d, ch_id=%d\n",
+			port->portno,
+			port->state,
+			ch_id);
+	//if (port->portno == EDMA_LOOPCHECK_PORT)
+	//	print_hex_dump(KERN_ERR, "1. loopcheck:", 0, 16, 1, buffer, 32, 1);
+	edma_chp = get_edma_channel_info(ch_id);
+
+	edma_chp->n_pld_sz = size;
+
 	if (port->portno != EDMA_AT_PORT)
 		nodep->data_addr = edma_virtaddr_to_pcieaddr(buffer);
 	else
@@ -822,163 +777,104 @@ static noinline int edma_port_read(struct edma_port *port, char *buffer, int siz
 			BUG_ON(1);
 			return -1;
 	}
-#else
-	/**
-	 * If wait_for_completion_interruptible(...) interrupted by 
-	 * SIGKILL(return -ERESTARTSYS), while data may be on the way,
-	 * so we need to read it again
-	*/
-	if (port->rx_int_done == 1) {
-		port->rx_int_done = 0;
-		goto read_last;
-	}
-	nodep->data_addr = edma_phyaddr_to_pcieaddr(edma_chp->pld_dma_addr);
-	PCIE_DBG("nodep->data_addr = 0x%llx\n", (u64)nodep->data_addr);
-#endif
 	reinit_completion(&port->rx_done);
 
-	memset(edma_chp->pld_virt_addr, 0, EDMA_PORT_BUFFER_SIZE);
-	barrier();
-	edma_adma_send(ch_id, NULL, 1, 0);
+	if (port->portno == EDMA_AT_PORT) {
+		if (at_buffer[0] == 0x0) {
+			edma_adma_send(ch_id, NULL, 1, 0);
+		}
+	} else
+		edma_adma_send(ch_id, NULL, 1, 0);
 
 	if (port->rx_submit) {
 		port->rx_submit(port->portno, NULL, 0, nodep);
 	}
 
-	ret = wait_for_completion_interruptible(&port->rx_done);
-	if(ret == -ERESTARTSYS) {
-		//ch_free_coherent(edma_chp, size);
-		PCIE_INFO("port%d read interrupted, pid:%d, comm:%s\n",
-			port->portno, current->pid, current->comm);
-		if (port->portno == EDMA_AT_PORT)
-			skw_pcie_write32(DMA_NODE_TOT_CNT(ch_id), 0x80000000);//clr dst node num
-		return 0;
-	}
-	port->rx_int_done = 0;
-	if(port->state == PORT_STATE_CLSE) {
-		//port->state = PORT_STATE_IDLE;
-		PCIE_INFO("port%d closed\n", port->portno);
-		goto err_out;
-	} else if(port->state == PORT_STATE_ASST) {
-		PCIE_INFO("CP ASSERT! port%d exit\n", port->portno);
-		if (priv->cp_state != CP_READY) {
-			if(port->portno == EDMA_LOG_PORT) {
-				port->state = PORT_STATE_OPEN;
-				PCIE_INFO("log port open\n");
+	if (!((port->portno == EDMA_AT_PORT) && (at_buffer[0] != 0))) {
+		ret = wait_for_completion_interruptible(&port->rx_done);
+		if(ret < 0)
+			return -ETIMEDOUT;
+		if(port->state == PORT_STATE_CLSE) {
+			port->state = PORT_STATE_IDLE;
+			return -EAGAIN;
+		}else if(port->state == PORT_STATE_ASST) {
+			PCIE_ERR("The CP assert  portno =%d error code =%d!!!!\n", port->portno, ENOTCONN);
+			if(priv->cp_state != 0){
+				if(port->portno == EDMA_LOG_PORT)
+					port->state = PORT_STATE_OPEN;
+				return -ENOTCONN;
 			}
-			goto err_out;
 		}
 	}
 
-read_last:
-	if (edma_chp->hdr_virt_addr == NULL) {
-		PCIE_ERR("hdr_virt_addr is NULL, ch_id:%d\n", ch_id);
-		goto err_out;
+	if (port->portno == EDMA_AT_PORT) {
+		memcpy(buffer, at_buffer, 256);
+		memset(at_buffer, 0, 256);
 	}
-	memcpy(buffer, edma_chp->pld_virt_addr, size);
 
 	if (port->portno == EDMA_LOOPCHECK_PORT)
 		print_hex_dump(KERN_ERR, "loopcheck:", 0, 16, 1, buffer, 32, 1);
 
 	if(port->state == PORT_STATE_CLSE) {
-		//port->state = PORT_STATE_IDLE;
-		PCIE_ERR("port%d closed\n", port->portno);
-		goto err_out;
+		port->state = PORT_STATE_IDLE;
+		return -EAGAIN;
 	}
 
-	PCIE_DBG("[-], port%d state=%s, ch_id=%d\n", port->portno, port_state[port->state], ch_id);
+	PCIE_DBG("[-], portno=%d, port_state=%d, ch_id=%d\n",
+		port->portno,
+		port->state,
+		ch_id);
 	//mutex_unlock(&port->rx_mutex);
-	//ch_free_coherent(edma_chp, size);
-	PCIE_DBG("[-]\n");
 	return nodep->data_len;
-err_out:
-	//ch_free_coherent(edma_chp, size);
-	PCIE_DBG("[-]\n");
-	return -110;
 }
 
-static noinline int edma_port_write(struct edma_port *port, char *buffer, int size)
+static int edma_port_write(struct edma_port *port, char *buffer, int size)
 {
-	u8 ch_id = port->tx_ch;
-	struct edma_chn_info *edma_chp = get_edma_channel_info(ch_id);
 	struct wcn_pcie_info *priv= get_pcie_device_info();
+	struct device *dev = &(priv->dev->dev);
+	struct edma_chn_info *edma_chp;
 	EDMA_HDR_T *nodep = port->tx_node;
+	u8 ch_id = port->tx_ch;
 	int ret;
 
-	//PCIE_DBG("[+]\n");
-	PCIE_DBG("portno=%d, port_state=%d, ch_id=%d\n", port->portno, port->state, ch_id);
+	PCIE_DBG("[+]\n");
+	edma_chp = get_edma_channel_info(ch_id);
 
-	//edma_chp->n_pld_sz = size;
-	if (port->state != PORT_STATE_OPEN) {
-		PCIE_ERR("port %d is not open:%s, exit\n", port->portno, port_state[port->state]);
-		return size;
-	}
-	//nodep->data_addr = edma_virtaddr_to_pcieaddr(buffer);
+	edma_chp->n_pld_sz = size;
+
+	nodep->data_addr = edma_virtaddr_to_pcieaddr(buffer);
 
 	if (port->portno == EDMA_LOG_PORT)
 		dump_stack();
 
-	//nodep->data_addr = edma_virtaddr_to_pcieaddr(buffer);
-#if 0
-	ret = ch_alloc_coherent(edma_chp, size);
-	if (ret) {
-	    PCIE_ERR("ch %d alloc coherent mem fail\n", ch_id);
-	    return ret;
-	}
-#endif
+	nodep->data_addr = edma_virtaddr_to_pcieaddr(buffer);
 	nodep->data_len = size;
-	nodep->data_addr = edma_phyaddr_to_pcieaddr(edma_chp->pld_dma_addr);
-	//PCIE_INFO("nodep->data_addr = 0x%x\n", nodep->data_addr);
-	memset(edma_chp->pld_virt_addr, 0, EDMA_PORT_BUFFER_SIZE);
-	barrier();
-	memcpy(edma_chp->pld_virt_addr, buffer, size); 
-	//print_hex_dump(KERN_ERR, "port write:", 0, 16, 1, edma_chp->pld_virt_addr, 32, 1);
 
 	//print_hex_dump(KERN_ERR, "plt:", 0, 16, 1, buffer, 64, 1);
-	PCIE_DBG("portno=%d, port_state=%s, ch_id=%d\n", port->portno, port_state[port->state], ch_id);
-#if 0
+	PCIE_DBG("portno=%d, port_state=%d, ch_id=%d\n",
+			port->portno,
+			port->state,
+			ch_id);
+
 	//map payload
 	edma_chp->map_pld_addr = dma_map_single(dev, buffer, edma_chp->n_pld_sz, DMA_TO_DEVICE);
 	if (dma_mapping_error(dev, edma_chp->map_pld_addr)) {
 			BUG_ON(1);
 			return -1;
 	}
-#endif
 	reinit_completion(&port->tx_done);
-	barrier();
 	edma_adma_send(ch_id, NULL, 1, 0);
 
 
 	ret = wait_for_completion_interruptible(&port->tx_done);
-	if(ret == -ERESTARTSYS) {
-		//ch_free_coherent(edma_chp, size);
-		PCIE_INFO("port%d write interrupted, pid:%d, comm:%s\n",
-				port->portno, current->pid, current->comm);
-		if (port->portno == EDMA_AT_PORT)
-			return size;
-		return 0;
-	}
+	if(ret < 0)
+		return -ETIMEDOUT;
 	if(port->state == PORT_STATE_CLSE) {
-		//port->state = PORT_STATE_IDLE;
-		PCIE_INFO("port%d closed\n", port->portno);
-		goto err_out;
-	} else if(port->state == PORT_STATE_ASST) {
-		PCIE_INFO("CP asserted  portno =%d error code =%d!!!!\n", port->portno, ENOTCONN);
-		if (priv->cp_state != CP_READY) {
-			if(port->portno == EDMA_LOG_PORT) {
-				port->state = PORT_STATE_OPEN;
-				PCIE_INFO("log port open\n");
-			}
-			goto err_out;
-		}
+		port->state = PORT_STATE_IDLE;
+		return -EAGAIN;
 	}
 	PCIE_DBG("[-]\n");
-	//ch_free_coherent(edma_chp, size);
-	return size;
-err_out:
-	PCIE_DBG("[-]\n");
-	//ch_free_coherent(edma_chp, size);
-	return size;
+	return nodep->data_len;
 }
 
 
@@ -1008,7 +904,7 @@ int send_data(int portno, char *buffer, int size)
 	struct edma_port *port = get_edma_port_info(portno);
 
 	PCIE_DBG("[+]\n");
-	PCIE_DBG("size:%d portno:%d port->state:%s\n", size, portno, port_state[port->state]);
+	PCIE_DBG("size:%d portno:%d port->state:%d\n", size, portno, port->state);
 	if(size==0)
 		return 0;
 	if(portno >= MAX_PORT_NUM)
@@ -1019,7 +915,7 @@ int send_data(int portno, char *buffer, int size)
 	return edma_port_write(port, buffer, size);
 }
 
-static void *edma_build_port_node(u8 ch)
+static void *edma_malloc_node(u8 ch, u8 count)
 {
 	struct wcn_pcie_info *priv= get_pcie_device_info();
 	struct device *dev = &(priv->dev->dev);
@@ -1031,27 +927,29 @@ static void *edma_build_port_node(u8 ch)
 		return NULL;
 	}
 
-	edma_chp->hdr_virt_addr = (EDMA_HDR_T *)dma_alloc_coherent(dev, PAGE_ALIGN(sizeof(EDMA_HDR_T) + EDMA_PORT_BUFFER_SIZE),
-					(dma_addr_t *)(&(edma_chp->hdr_dma_addr)), GFP_KERNEL);
-	if (!edma_chp->hdr_virt_addr) {
+	if (dma_set_mask(dev, DMA_BIT_MASK(64))) {
+		PCIE_ERR("dma_set_mask err\n");
+		if (dma_set_coherent_mask(dev, DMA_BIT_MASK(64))) {
+			PCIE_ERR("dma_set_coherent_mask err\n");
+			return NULL;
+		}
+	}
+
+	edma_chp->p_link_hdr = (EDMA_HDR_T *)dma_alloc_coherent(dev, PAGE_ALIGN(count * sizeof(EDMA_HDR_T)),
+					(dma_addr_t *)(&(edma_chp->dma_hdr_handle)), GFP_DMA);
+	if (!edma_chp->p_link_hdr) {
 		PCIE_ERR("alloc mem fail\n");
 		return NULL;
 	}
-	nodep = edma_chp->hdr_virt_addr;
-	edma_chp->pld_virt_addr = edma_chp->hdr_virt_addr + sizeof(EDMA_HDR_T);
-	edma_chp->pld_dma_addr = edma_chp->hdr_dma_addr + sizeof(EDMA_HDR_T);
-	memset(edma_chp->pld_virt_addr, 0, EDMA_PORT_BUFFER_SIZE);
-	nodep->next_hdr = edma_phyaddr_to_pcieaddr(edma_chp->hdr_dma_addr) + 8;
-	PCIE_DBG("ch %d alloc tmpbuf:0x%llx\n", edma_chp->chn_id, edma_chp->hdr_dma_addr);
 
 #if 0
 	/* build ring linklist */
 	for (i = 0;i < count;i++) {
-			edma_chp->hdr_virt_addr[i].next_hdr =
-				edma_phyaddr_to_pcieaddr(edma_chp->hdr_dma_addr + ((i + 1) % count) * sizeof(EDMA_HDR_T) + 8);
+			edma_chp->p_link_hdr[i].next_hdr =
+				edma_phyaddr_to_pcieaddr(edma_chp->dma_hdr_handle + ((i + 1) % count) * sizeof(EDMA_HDR_T) + 8);
 	}
 #endif
-	nodep = (EDMA_HDR_T *)edma_chp->hdr_virt_addr;
+	nodep = (EDMA_HDR_T *)edma_chp->p_link_hdr;
 
 	return nodep;
 }
@@ -1059,9 +957,12 @@ static void *edma_build_port_node(u8 ch)
 static int port_rx_int_cb(void *context, u64 head, u64 tail, int count)
 {
 	struct edma_chn_info *edma_chp = context;
+	struct wcn_pcie_info *priv= get_pcie_device_info();
+	struct device *dev = &(priv->dev->dev);
 	u8 ch = edma_chp->chn_id;
 	u8 portno = EDMACH2PORTNO(ch);
 	struct edma_port *port = &edma_ports[portno];
+	u64 tmp;
 
 	edma_chp = get_edma_channel_info(ch);
 	edma_chp->rcv_tail_cpu_addr = edma_coherent_rcvheader_to_cpuaddr((u64)tail, edma_chp);
@@ -1071,10 +972,23 @@ static int port_rx_int_cb(void *context, u64 head, u64 tail, int count)
 		barrier();
 		PCIE_DBG("wait for ch_id:%d node done flag...\n", ch);
 	}
+
 	((EDMA_HDR_T *)((char *)edma_chp->rcv_header_cpu_addr-8))->done = 0;
 
-	port->rx_int_done = 1;
+	tmp = edma_pcieaddr_to_phyaddr(((EDMA_HDR_T *)((char *)edma_chp->rcv_tail_cpu_addr-8))->data_addr);
+	dma_unmap_single(dev, tmp, edma_chp->n_pld_sz, DMA_FROM_DEVICE);
+
 	complete(&port->rx_done);
+#ifdef CONFIG_BT_SEEKWAVE
+	if (portno == EDMA_BTCMD_PORT || portno == EDMA_BTACL_PORT ||
+		portno == EDMA_BTAUDIO_PORT || portno == EDMA_ISOC_PORT) {
+			port->state = PORT_STATE_BUSY;
+			port->rx_size = ((EDMA_HDR_T *)((char *)edma_chp->rcv_header_cpu_addr-8))->data_len;
+			port->rx_buf_addr = bt_rx_buffer[portno];
+			if(port->rx_submit)
+				schedule_work(&priv->bt_rx_work);
+	}
+#endif
 
 	return 0;
 }
@@ -1082,44 +996,20 @@ static int port_rx_int_cb(void *context, u64 head, u64 tail, int count)
 static int port_tx_int_cb(void *context, u64 head, u64 tail, int count)
 {
 	struct edma_chn_info *edma_chp = context;
+	struct wcn_pcie_info *priv= get_pcie_device_info();
 	u8 ch = edma_chp->chn_id;
+	struct device *dev = &(priv->dev->dev);
 	u8 portno = EDMACH2PORTNO(ch);
 	struct edma_port *port = &edma_ports[portno];
+	u64 tmp;
 
+	edma_chp->rcv_tail_cpu_addr = edma_coherent_rcvheader_to_cpuaddr((u64)tail, edma_chp);
+	tmp = edma_pcieaddr_to_phyaddr(((EDMA_HDR_T *)((char *)edma_chp->rcv_tail_cpu_addr-8))->data_addr);
+	dma_unmap_single(dev, tmp, edma_chp->n_pld_sz, DMA_TO_DEVICE);
 	complete(&port->tx_done);
 
 	return 0;
 }
-
-#ifdef CONFIG_BT_SEEKWAVE
-static int pcie_bt_rx_entry(void *para)
-{
-	struct edma_port *port = para;
-	char *buffer;
-	int read, size;
-
-	PCIE_INFO("port%d bt rx thread entry\n", port->portno);
-	size = 2048;
-	buffer = kzalloc(size, GFP_KERNEL);
-	while(port->state == PORT_STATE_OPEN && buffer) {
-		read = 0;
-		memset(buffer, 0, size);
-		read = recv_data(port->portno, buffer, size);
-		if(read <= 0) {
-			PCIE_DBG("edma read_len=%d\n", read);
-			break;
-		}
-		if(port->rx_submit)
-			port->rx_submit(port->portno, port->rx_data, read, buffer);
-	}
-	PCIE_INFO("port%d is stopped\n", port->portno);
-
-	if(buffer)
-		kfree(buffer);
-	up(&port->sem);
-	return 0;
-}
-#endif
 
 
 int open_edma_port(int portno, void *callback, void *data)
@@ -1129,93 +1019,70 @@ int open_edma_port(int portno, void *callback, void *data)
 	struct skw_channel_cfg chn_cfg_rx = {0}, chn_cfg_tx = {0};
 	struct edma_chn_info *rx_edma_chp;
 	struct edma_chn_info *tx_edma_chp;
-#ifdef CONFIG_BT_SEEKWAVE
-	char thread_name[32];
-#endif
 
-	if(portno >= MAX_PORT_NUM){
-		PCIE_ERR("portno:%d error\n", portno);
+	if(portno >= MAX_PORT_NUM)
 		return -EINVAL;
-	}
+	PCIE_DBG("[+]\n");
 	port = &edma_ports[portno];
 	port->rx_ch = PORT_TO_EDMA_RX_CHANNEL(portno);
 	port->tx_ch = PORT_TO_EDMA_TX_CHANNEL(portno);
 	rx_edma_chp = get_edma_channel_info(port->rx_ch);
 	tx_edma_chp = get_edma_channel_info(port->tx_ch);
 
-	PCIE_INFO("[+]port[%d] state:%s, pid:%d, comm:%s\n",
-			portno, port_state[port->state], current->pid, current->comm);
-	if((port->state==PORT_STATE_OPEN) || port->rx_submit) {
-		PCIE_INFO("[-]port[%d] opened already, exit!!!\n", portno);
+	if((port->state==PORT_STATE_OPEN) || port->rx_submit)
 		return -EBUSY;
-	}
 	port->rx_submit = callback;
 	port->rx_data = data;
 	port->rx_wp = port->rx_rp = 0;
 	port->portno = portno;
 	init_completion(&port->rx_done);
 	init_completion(&port->tx_done);
+	mutex_init(&port->rx_mutex);
 	port->state = PORT_STATE_OPEN;
 
 	chn_cfg_rx.direction = EDMA_RX;
-	nodep = edma_build_port_node(port->rx_ch);
+	nodep = edma_malloc_node(port->rx_ch, 1);
 	if(nodep) {
-		//nodep->next_hdr = edma_phyaddr_to_pcieaddr(rx_edma_chp->hdr_dma_addr) + 8;
+		nodep->next_hdr = edma_phyaddr_to_pcieaddr(rx_edma_chp->dma_hdr_handle) + 8;
 		chn_cfg_rx.complete_callback = port_rx_int_cb;
 		chn_cfg_rx.empty_callback = NULL;
-		chn_cfg_rx.header = edma_phyaddr_to_pcieaddr(rx_edma_chp->hdr_dma_addr) + 8;
+		chn_cfg_rx.header = nodep->next_hdr;
 		chn_cfg_rx.split = 1;
 		chn_cfg_rx.node_count = 1;
 		chn_cfg_rx.req_mode = EDMA_LINKLIST_MODE;
 		chn_cfg_rx.context = get_edma_channel_info(port->rx_ch);
 		edma_channel_init(port->rx_ch, &chn_cfg_rx, NULL);
 		port->rx_node = nodep;
-	} else{
-		PCIE_ERR("[-]port[%d] build rx node failed\n", portno);
+	} else
 		return -EINVAL;
-	}
 
 	chn_cfg_tx.direction = EDMA_TX;
 	chn_cfg_tx.split = 1;
-	nodep = edma_build_port_node(port->tx_ch);
+	nodep = edma_malloc_node(port->tx_ch, 1);
 	if(nodep) {
-		//nodep->next_hdr = edma_phyaddr_to_pcieaddr(tx_edma_chp->hdr_dma_addr) + 8;
+		nodep->next_hdr = edma_phyaddr_to_pcieaddr(tx_edma_chp->dma_hdr_handle) + 8;
 		chn_cfg_tx.complete_callback = port_tx_int_cb;
 		chn_cfg_tx.empty_callback = NULL;
-		chn_cfg_tx.header = edma_phyaddr_to_pcieaddr(tx_edma_chp->hdr_dma_addr) + 8;
+		chn_cfg_tx.header = nodep->next_hdr;
 		chn_cfg_tx.split = 1;
 		chn_cfg_tx.node_count = 1;
 		chn_cfg_tx.req_mode = EDMA_LINKLIST_MODE;
 		chn_cfg_tx.context = get_edma_channel_info(port->tx_ch);
 		edma_channel_init(port->tx_ch, &chn_cfg_tx, NULL);
 		port->tx_node = nodep;
-	} else{
-		PCIE_ERR("[-]port[%d] build tx node failed\n", portno);
+	} else
 		return -EINVAL;
-	}
 #ifdef CONFIG_BT_SEEKWAVE
 	if (portno == EDMA_BTCMD_PORT || portno == EDMA_BTACL_PORT ||
-			portno == EDMA_BTAUDIO_PORT || portno == EDMA_ISOC_PORT) {
-		if(callback && data && !port->thread) {
-			sema_init(&port->sem, 0);
-			sprintf(thread_name, "%s%d", "BTRX", portno);
-			port->thread = kthread_create(pcie_bt_rx_entry, port, thread_name);
-			if (IS_ERR(port->thread)) {
-				long err = PTR_ERR(port->thread);
-				PCIE_ERR("[-] create port%d rx thread failed with error %ld\n", portno, err);
-				port_sta_rec[portno] = 1;
-				return err;
-			}
-			wake_up_process(port->thread);
+		portno == EDMA_BTAUDIO_PORT || portno == EDMA_ISOC_PORT) {
+		if (bt_rx_prepare(portno))
+			return -1;
 		}
-	}
 #endif
-	if(portno == EDMA_LOG_PORT){
-		skw_pcie_cp_log(0);
-		mdelay(100);
-	}
 	port_sta_rec[portno] = 1;
-	PCIE_INFO("[-]port[%d] state:%s\n", portno, port_state[port->state]);
+	PCIE_DBG("[-], portno=%d, port_state=%d\n",
+				portno,
+				port->state);
 	return 0;
 }
 
@@ -1226,147 +1093,118 @@ int close_edma_port(int portno)
 	struct device *dev = &(priv->dev->dev);
 	struct edma_chn_info *edma_chp;
 	u32 val;
-	u8 edma_int_pending = 0;
-	u8 pcie_link_down = 0;
-	int ret = 0;
-
-	mutex_lock(&priv->close_mutex);
-	PCIE_INFO("[+]port[%d] state:%s, pid:%d, comm:%s\n", portno, port_state[port->state], current->pid, current->comm);
-	if (portno == EDMA_BTACL_PORT || portno == EDMA_BTCMD_PORT || portno == EDMA_BTAUDIO_PORT || portno == EDMA_ISOC_PORT) {
-		if (priv->svc_op != BT_STOP) {
-			mutex_unlock(&priv->close_mutex);
-			PCIE_INFO("[-]port[%d] wait bt service stop\n", portno);
-			return 0;
-		}
-	}
+#ifdef CONFIG_BT_SEEKWAVE
+	int i;
+#endif
 
 	if(portno == EDMA_LOG_PORT){
 		skw_pcie_cp_log(1);
 		mdelay(100);
 	}
 
+	PCIE_INFO("[+]close port[%d]\n", portno);
+	mutex_lock(&port->rx_mutex);
 	if (port_sta_rec[portno] == 0) {
 		PCIE_INFO("[-]port[%d] no open, exit\n", portno);
-		mutex_unlock(&priv->close_mutex);
+		mutex_unlock(&port->rx_mutex);
 		return 0;
 	}
-
-	if (!pci_device_is_present(priv->dev)) {
-		PCIE_ERR("PCIe link is Down!!!\n");
-		pcie_link_down = 1;
-	}
-
 #if 1 //XXX: for debug
 	val = skw_pcie_read32(DMA_SRC_INT(port->tx_ch));
 	if (val & BIT(8)) {
-		PCIE_INFO("edma_src_int[%d]=0x%08x\n", port->tx_ch, val);
+		PCIE_INFO("1.port->tx_ch=%d, edma_src_int=0x%08x\n", port->tx_ch, val);
 		mdelay(10);
 		val = skw_pcie_read32(DMA_SRC_INT(port->tx_ch));
-		PCIE_INFO("edma_src_int[%d]=0x%08x\n", port->tx_ch, val);
+		PCIE_INFO("2.port->tx_ch=%d, edma_src_int=0x%08x\n", port->tx_ch, val);
 		mdelay(10);
 		val = skw_pcie_read32(DMA_SRC_INT(port->tx_ch));
-		PCIE_INFO("edma_src_int[%d]=0x%08x\n", port->tx_ch, val);
-		edma_int_pending = 1;
+		PCIE_INFO("3.port->tx_ch=%d, edma_src_int=0x%08x\n", port->tx_ch, val);
+		send_modem_assert_command();
+		BUG_ON(1);
 	}
 	val = skw_pcie_read32(DMA_DST_INT(port->rx_ch));
 	if (val & BIT(8)) {
-		PCIE_INFO("edma_dst_int[%d]=0x%08x\n", port->rx_ch, val);
+		PCIE_INFO("1.port->rx_ch=%d, edma_dst_int=0x%08x\n", port->rx_ch, val);
 		mdelay(10);
 		val = skw_pcie_read32(DMA_DST_INT(port->rx_ch));
-		PCIE_INFO("edma_dst_int[%d]=0x%08x\n", port->rx_ch, val);
+		PCIE_INFO("2.port->rx_ch=%d, edma_dst_int=0x%08x\n", port->rx_ch, val);
 		mdelay(10);
 		val = skw_pcie_read32(DMA_DST_INT(port->rx_ch));
-		PCIE_INFO("edma_dst_int[%d]=0x%08x\n", port->rx_ch, val);
-		edma_int_pending = 1;
+		PCIE_INFO("3.port->rx_ch=%d, edma_dst_int=0x%08x\n", port->rx_ch, val);
+		send_modem_assert_command();
+		BUG_ON(1);
 	}
 #endif
 	close_edma_channel(port->tx_ch);
-	close_edma_channel(port->rx_ch);
-
 	edma_chp = get_edma_channel_info(port->tx_ch);
-	dma_free_coherent(dev, PAGE_ALIGN(sizeof(EDMA_HDR_T) + EDMA_PORT_BUFFER_SIZE),
-			edma_chp->hdr_virt_addr, edma_chp->hdr_dma_addr);
-	edma_chp->hdr_virt_addr = NULL;
-	edma_chp->hdr_dma_addr = 0;
-	edma_chp->pld_virt_addr = NULL;
-	edma_chp->pld_dma_addr = 0;
-
-	barrier();
+	dma_free_coherent(dev, PAGE_ALIGN(1 * sizeof(EDMA_HDR_T)),
+			edma_chp->p_link_hdr, edma_chp->dma_hdr_handle);
+	close_edma_channel(port->rx_ch);
 	edma_chp = get_edma_channel_info(port->rx_ch);
-	dma_free_coherent(dev, PAGE_ALIGN(sizeof(EDMA_HDR_T) + EDMA_PORT_BUFFER_SIZE),
-			edma_chp->hdr_virt_addr, edma_chp->hdr_dma_addr);
-	edma_chp->hdr_virt_addr = NULL;
-	edma_chp->hdr_dma_addr = 0;
-	edma_chp->pld_virt_addr = NULL;
-	edma_chp->pld_dma_addr = 0;
-
+	dma_free_coherent(dev, PAGE_ALIGN(1 * sizeof(EDMA_HDR_T)),
+			edma_chp->p_link_hdr, edma_chp->dma_hdr_handle);
+#ifdef CONFIG_BT_SEEKWAVE
+for (i = 0;i < 4;i++)
+		kfree(bt_rx_buffer[i]);
+#endif
+	//while(!rx_done_reset);
+	//complete(&port->rx_done);
 	port->state = PORT_STATE_CLSE;
 	port->tx_line = NULL;
 	port->rx_line = NULL;
 	port->tx_index = 0;
 	port->rx_wp = port->rx_rp = 0;
 	port->rx_submit = NULL;
-
-#ifdef CONFIG_BT_SEEKWAVE
-	if(port->thread && !down_interruptible(&port->sem))
-		PCIE_INFO("port%d rx thread exit\n", portno);
-	port->thread = NULL;
-#endif
-	//memset(port, 0, sizeof(struct edma_port));
-	port_sta_rec[portno] = 0;
-	if (edma_int_pending)
-		PCIE_ERR("port[%d] edma int pending!!!\n", portno);
-	if (pcie_link_down){
-		ret = -ENODEV;
-	}
-	PCIE_INFO("[-]port[%d] state:%s, pid:%d, comm:%s\n", portno, port_state[port->state], current->pid, current->comm);
 	complete(&port->rx_done);
 	complete(&port->tx_done);
-	mutex_unlock(&priv->close_mutex);
-	return ret;
+	//memset(port, 0, sizeof(struct edma_port));
+	port_sta_rec[portno] = 0;
+	PCIE_INFO("[-]port[%d] closed\n", portno);
+	mutex_unlock(&port->rx_mutex);
+	return 0;
 }
 
 static int wifi_service_start(void)
 {
-	int ret = 0;
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	if (priv->boot_data == NULL)
+	int ret =0;
+	struct wcn_pcie_info *priv= get_pcie_device_info();
+	if(priv->boot_data==NULL)
 		return ret;
 
-	ret = priv->boot_data->wifi_start();
+	ret=priv->boot_data->wifi_start();
 	return ret;
 }
 
 static int wifi_service_stop(void)
 {
-	int ret = 0;
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	if (priv->boot_data == NULL || priv->cp_state != CP_READY)
+	int ret =0;
+	struct wcn_pcie_info *priv= get_pcie_device_info();
+	if(priv->boot_data ==NULL|| priv->cp_state)
 		return ret;
 
-	ret = priv->boot_data->wifi_stop();
+	ret=priv->boot_data->wifi_stop();
 	return ret;
 }
 
 static int bt_service_start(void)
 {
-	int ret = 0;
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	if(priv->boot_data == NULL)
+	int ret =0;
+	struct wcn_pcie_info *priv= get_pcie_device_info();
+	if(priv->boot_data==NULL)
 		return ret;
 
-	ret = priv->boot_data->bt_start();
+	ret=priv->boot_data->bt_start();
 	return ret;
 }
 
 static int bt_service_stop(void)
 {
-	int ret = 0;
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	if (priv->boot_data == NULL || priv->cp_state != CP_READY)
+	int ret =0;
+	struct wcn_pcie_info *priv= get_pcie_device_info();
+	if(priv->boot_data ==NULL|| priv->cp_state)
 		return ret;
 
-	ret = priv->boot_data->bt_stop();
+	ret=priv->boot_data->bt_stop();
 	return ret;
 }
 
@@ -1374,22 +1212,24 @@ void edma_unmask_channel(int channel)
 {
 	DMA_DST_INT_S reg_chn_dst_int = {0};
 	DMA_SRC_INT_S reg_chn_src_int = {0};
-	struct edma_chn_info *edma_chp = get_edma_channel_info(channel);
 
-	if (edma_chp->chn_cfg.direction == EDMA_TX) {
-		reg_chn_src_int.u32 = skw_pcie_read32(DMA_SRC_INT(channel));
-		reg_chn_src_int.src_complete_int_en = 1;
-		reg_chn_src_int.src_cfg_err_int_en = 1;
-		reg_chn_src_int.src_list_empty_int_en = 0;
+	if (channel == EDMA_WIFI_TX0_FREE_ADDR || channel == EDMA_WIFI_TX1_FREE_ADDR
+		|| channel == EDMA_WIFI_RX0_PKT_ADDR || channel == EDMA_WIFI_RX1_PKT_ADDR
+		|| channel == EDMA_WIFI_RX0_FILTER_DATA_CHN || channel == EDMA_WIFI_RX1_FILTER_DATA_CNH) {
 
-		skw_pcie_write32(DMA_SRC_INT(channel), reg_chn_src_int.u32);
-	} else {
 		reg_chn_dst_int.u32 = skw_pcie_read32(DMA_DST_INT(channel));
 		reg_chn_dst_int.dst_complete_int_en = 1;
 		reg_chn_dst_int.dst_cfg_err_int_en = 1;
 		reg_chn_dst_int.dst_list_empty_int_en = 0;
 
 		skw_pcie_write32(DMA_DST_INT(channel), reg_chn_dst_int.u32);
+	} else if (channel == EDMA_WIFI_TX0_PACKET_ADDR || channel == EDMA_WIFI_TX1_PACKET_ADDR) {
+		reg_chn_src_int.u32 = skw_pcie_read32(DMA_SRC_INT(channel));
+		reg_chn_src_int.src_complete_int_en = 1;
+		reg_chn_src_int.src_cfg_err_int_en = 1;
+		reg_chn_src_int.src_list_empty_int_en = 0;
+
+		skw_pcie_write32(DMA_SRC_INT(channel), reg_chn_src_int.u32);
 	}
 }
 
@@ -1397,60 +1237,25 @@ void edma_mask_channel(int channel)
 {
 	DMA_DST_INT_S reg_chn_dst_int = {0};
 	DMA_SRC_INT_S reg_chn_src_int = {0};
-	struct edma_chn_info *edma_chp = get_edma_channel_info(channel);
 
-	if (edma_chp->chn_cfg.direction == EDMA_TX) {
-		reg_chn_src_int.u32 = skw_pcie_read32(DMA_SRC_INT(channel));
-		reg_chn_src_int.src_complete_int_clr = 1;
-		reg_chn_src_int.src_complete_int_en = 0;
-		reg_chn_src_int.src_cfg_err_int_en = 0;
-		reg_chn_src_int.src_list_empty_int_en = 0;
+	if (channel == EDMA_WIFI_TX0_FREE_ADDR || channel == EDMA_WIFI_TX1_FREE_ADDR
+		|| channel == EDMA_WIFI_RX0_PKT_ADDR || channel == EDMA_WIFI_RX1_PKT_ADDR
+		|| channel == EDMA_WIFI_RX0_FILTER_DATA_CHN || channel == EDMA_WIFI_RX1_FILTER_DATA_CNH) {
 
-		skw_pcie_write32(DMA_SRC_INT(channel), reg_chn_src_int.u32);
-	} else {
 		reg_chn_dst_int.u32 = skw_pcie_read32(DMA_DST_INT(channel));
-		reg_chn_dst_int.dst_complete_int_clr = 1;
 		reg_chn_dst_int.dst_complete_int_en = 0;
 		reg_chn_dst_int.dst_cfg_err_int_en = 0;
 		reg_chn_dst_int.dst_list_empty_int_en = 0;
 
 		skw_pcie_write32(DMA_DST_INT(channel), reg_chn_dst_int.u32);
+	} else if (channel == EDMA_WIFI_TX0_PACKET_ADDR || channel == EDMA_WIFI_TX1_PACKET_ADDR) {
+		reg_chn_src_int.u32 = skw_pcie_read32(DMA_SRC_INT(channel));
+		reg_chn_src_int.src_complete_int_en = 0;
+		reg_chn_src_int.src_cfg_err_int_en = 0;
+		reg_chn_src_int.src_list_empty_int_en = 0;
+
+		skw_pcie_write32(DMA_SRC_INT(channel), reg_chn_src_int.u32);
 	}
-}
-
-int edma_channel_irq_info(int channel, u64 *head, u64 *tail, int *count)
-{
-	u64 val;
-	EDMA_ADDR_T node_addr0={0}, node_addr1={0};
-	DMA_SRC_INT_DSCR_HIGH_S chn_src_node_cnt;
-	DMA_DST_INT_DSCR_HIGH_S chn_dst_node_cnt;
-	struct edma_chn_info *edma_chp = get_edma_channel_info(channel);
-
-	if (edma_chp->chn_cfg.direction == EDMA_TX) {
-		node_addr0.addr_l32 = skw_pcie_read32(DMA_SRC_INT_DSCR_HEAD_LOW(channel));
-		node_addr1.addr_l32 = skw_pcie_read32(DMA_SRC_INT_DSCR_TAIL_LOW(channel));
-		chn_src_node_cnt.u32 = skw_pcie_read32(DMA_SRC_INT_DSCR_HIGH(channel));
-		*count = chn_src_node_cnt.src_node_done_num;
-
-		val = chn_src_node_cnt.src_int_dscr_head_high & 0xff;
-		*head = (u64)(node_addr0.addr_l32 | (val << 32));
-
-		val = chn_src_node_cnt.src_int_dscr_tail_high & 0xff;
-		*tail = (u64)(node_addr1.addr_l32 | (val << 32));
-	} else {
-		node_addr0.addr_l32 = skw_pcie_read32(DMA_DST_INT_DSCR_HEAD_LOW(channel));
-		node_addr1.addr_l32 = skw_pcie_read32(DMA_DST_INT_DSCR_TAIL_LOW(channel));
-		chn_dst_node_cnt.u32 = skw_pcie_read32(DMA_DST_INT_DSCR_HIGH(channel));
-		*count = chn_dst_node_cnt.dst_node_done_num;
-
-		val = chn_dst_node_cnt.dst_int_dscr_head_high & 0xff;
-		*head = (u64)(node_addr0.addr_l32 | (val << 32));
-
-		val = chn_dst_node_cnt.dst_int_dscr_tail_high & 0xff;
-		*tail = (u64)(node_addr1.addr_l32 | (val << 32));
-	}
-
-	return 0;
 }
 
 int msi_irq_wifi_takeover_handler(int irq_num)
@@ -1490,18 +1295,24 @@ int msi_irq_wifi_takeover_handler(int irq_num)
 
 int legacy_irq_wifi_takeover_handler(int ch_id)
 {
-	int num;
-	u64 head, tail;
-	struct edma_chn_info *edma_chp = get_edma_channel_info(ch_id);
+	struct edma_chn_info *edma_chp;
+	DMA_DST_INT_S reg_chn_dst_int = {0};
+
+	edma_chp = get_edma_channel_info(ch_id);
+
+	if (ch_id == EDMA_WIFI_TX0_FREE_ADDR || ch_id == EDMA_WIFI_TX1_FREE_ADDR
+		|| ch_id == EDMA_WIFI_RX0_PKT_ADDR || ch_id == EDMA_WIFI_RX1_PKT_ADDR
+		|| ch_id == EDMA_WIFI_RX0_FILTER_DATA_CHN || ch_id == EDMA_WIFI_RX1_FILTER_DATA_CNH) {
+
+		reg_chn_dst_int.u32 = skw_pcie_read32(DMA_DST_INT(ch_id));
+		reg_chn_dst_int.dst_complete_int_clr = 1;
+		reg_chn_dst_int.dst_complete_int_en = 0;
+		skw_pcie_write32(DMA_DST_INT(ch_id), reg_chn_dst_int.u32);
+		skw_pcie_read32(DMA_DST_INT_DSCR_HIGH(ch_id));
+	}
 
 	if(edma_chp->chn_cfg.complete_callback)
-		return edma_chp->chn_cfg.complete_callback(edma_chp->chn_cfg.context, 0, 0, -1);
-
-	edma_mask_channel(ch_id);
-
-	edma_channel_irq_info(ch_id, &head, &tail, &num);
-
-	edma_unmask_channel(ch_id);
+		edma_chp->chn_cfg.complete_callback(edma_chp->chn_cfg.context, 0, 0, 0);
 
 	return 0;
 }
@@ -1536,8 +1347,7 @@ struct sv6160_platform_data wifi_pdata = {
 		  .write = send_data,
 	},
 	.edma_get_node_tot_cnt = edma_get_node_tot_cnt,
-	.edma_clear_node_count = edma_clear_node_count,
-	.edma_channel_irq_info = edma_channel_irq_info,
+	.edma_clear_src_node_count = edma_clear_src_node_count,
 };
 
 struct sv6160_platform_data ucom_pdata = {
@@ -1556,28 +1366,83 @@ struct sv6160_platform_data ucom_pdata = {
 	.modem_unregister_notify = modem_unregister_notify,
 	.service_start = bt_service_start,
 	.service_stop = bt_service_stop,
-	.skw_dump_mem = skw_pcie_mem_dump,
 };
 
-int skw_pcie_bind_platform_driver(struct platform_device *boot_dev)
+#ifdef CONFIG_BT_SEEKWAVE
+void bt_rx_work(struct work_struct *work)
+{
+	int ch_id, i;
+	struct edma_port *port;
+	struct edma_chn_info *edma_chp;
+	struct wcn_pcie_info *priv = get_pcie_device_info();
+	struct device *dev = &(priv->dev->dev);
+
+	for (i = 0;i < 4;i++) {
+		port = get_edma_port_info(i);
+		ch_id = port->rx_ch;
+		edma_chp = get_edma_channel_info(ch_id);
+		PCIE_DBG("portno:%d,port->state:%d\n", i, port->state);
+		if (port->state == PORT_STATE_BUSY) {
+			port->rx_submit(i, port->rx_data, port->rx_size, (void *)port->rx_buf_addr);
+			//map payload
+			edma_chp->map_pld_addr = dma_map_single(dev, bt_rx_buffer[i], edma_chp->n_pld_sz, DMA_FROM_DEVICE);
+			if (dma_mapping_error(dev, edma_chp->map_pld_addr)) {
+				PCIE_ERR("dma_mapping_error, portno:%d\n", i);
+				BUG_ON(1);
+			}
+			port->state = PORT_STATE_OPEN;
+			edma_adma_send(ch_id, NULL, 1, 0);
+		}
+	}
+}
+
+int bt_rx_prepare(int portno)
+{
+	struct edma_port *port;
+	struct edma_chn_info *edma_chp;
+	EDMA_HDR_T *nodep;
+	u8 ch_id;
+	struct wcn_pcie_info *priv = get_pcie_device_info();
+	struct device *dev = &(priv->dev->dev);
+
+	port = get_edma_port_info(portno);
+	ch_id = port->rx_ch;
+	edma_chp = get_edma_channel_info(ch_id);
+	nodep = port->rx_node;
+	edma_chp->n_pld_sz = ucom_pdata.max_buffer_size;
+	bt_rx_buffer[portno] = kzalloc(edma_chp->n_pld_sz, GFP_DMA);
+	nodep->data_addr = edma_virtaddr_to_pcieaddr(bt_rx_buffer[portno]);
+	//map payload
+	edma_chp->map_pld_addr = dma_map_single(dev, bt_rx_buffer[portno], edma_chp->n_pld_sz, DMA_FROM_DEVICE);
+	if (dma_mapping_error(dev, edma_chp->map_pld_addr)) {
+			PCIE_ERR("dma_mapping_error\n");
+			return -1;
+	}
+	port->state = PORT_STATE_OPEN;
+	edma_adma_send(ch_id, NULL, 1, 0);
+
+	return 0;
+}
+#endif
+
+int skw_pcie_bind_platform_driver(struct pci_dev *pci_dev)
 {
 	struct platform_device *pdev;
 	char	pdev_name[32];
 	struct edma_port *port;
 	int ret = 0;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct device *parent_dev = &priv->dev->dev;
 
-	PCIE_INFO("[+]\n");
+	PCIE_INFO("\n");
 	memset(edma_ports, 0, sizeof(struct edma_port) * MAX_PORT_NUM);
 	sprintf(pdev_name, "skw_ucom");
 /*
  *	creaete AT device
  */
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
-	if(!pdev)
+	if(!pdev)	
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "ATC";
@@ -1585,34 +1450,39 @@ int skw_pcie_bind_platform_driver(struct platform_device *boot_dev)
 	memcpy(ucom_pdata.chipid, priv->chip_id, SKW_CHIP_ID_LENGTH);
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data \n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
-
 /*
  *	creaete log device
  */
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "LOG";
 	ucom_pdata.data_port = EDMA_LOG_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add %s device \n", ucom_pdata.port_name);
+		dev_err(&pci_dev->dev, "failed to add %s device \n", ucom_pdata.port_name);
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1620,12 +1490,6 @@ int skw_pcie_bind_platform_driver(struct platform_device *boot_dev)
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
 
 /*
  *	creaete LOOPCHECK device
@@ -1633,14 +1497,20 @@ int skw_pcie_bind_platform_driver(struct platform_device *boot_dev)
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "LOOPCHECK";
 	ucom_pdata.data_port = EDMA_LOOPCHECK_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data \n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1648,38 +1518,28 @@ int skw_pcie_bind_platform_driver(struct platform_device *boot_dev)
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
-
-	PCIE_INFO("[-]\n");
 	return ret;
 }
 
-int skw_pcie_bind_wifi_driver(struct platform_device *boot_dev)
+int skw_pcie_bind_wifi_driver(struct pci_dev *pci_dev)
 {
 	struct platform_device *pdev;
 	char	pdev_name[32];
 	int ret = 0;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct device *parent_dev = &priv->dev->dev;
 
-	PCIE_INFO("[+]\n");
+	PCIE_INFO("\n");
 	sprintf(pdev_name, "%s%d", SV6316_WIRELESS, 1);
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	memcpy(wifi_pdata.chipid, priv->chip_id, SKW_CHIP_ID_LENGTH);
-	wifi_pdata.pcie_dev = &(priv->dev->dev);
 	ret = platform_device_add_data(pdev, &wifi_pdata, sizeof(wifi_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data\n");
+		dev_err(&pci_dev->dev, "failed to add platform data\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1687,35 +1547,31 @@ int skw_pcie_bind_wifi_driver(struct platform_device *boot_dev)
 	wifi_data_pdev = pdev;
 	ret = platform_device_add(pdev);
 	if(ret) {
-		PCIE_ERR("fail to register platform device\n");
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 	}
 	PCIE_DBG("add device successful\n");
-	PCIE_INFO("[-]\n");
 
 	return ret;
 }
 
 #ifdef CONFIG_BT_SEEKWAVE
-int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
+int skw_pcie_bind_bt_driver(struct pci_dev *pci_dev)
 {
 	struct platform_device *pdev;
 	char	pdev_name[32];
 	struct edma_port *port;
 	int ret = 0;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct device *parent_dev = &priv->dev->dev;
 
-	PCIE_INFO("[+]\n");
+	PCIE_INFO("[-]\n");
 	sprintf(pdev_name, "btseekwave");
 
 	/*creaete BT DATA device*/
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
-	if(!pdev){
-		PCIE_ERR("[-]failed to allocate platform device\n");
+	if(!pdev)
 		return -ENOMEM;
-	}
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	memcpy(ucom_pdata.chipid, priv->chip_id, SKW_CHIP_ID_LENGTH);
@@ -1724,12 +1580,17 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	ucom_pdata.audio_port = EDMA_BTAUDIO_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("[-]failed to add platform data\n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
 
-	bt_data_pdev = pdev;
 	port = get_edma_port_info(ucom_pdata.data_port);
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
@@ -1742,27 +1603,19 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
 
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_INFO("[-]fail to register platform device\n")
-		platform_device_put(pdev);
-		return ret;
-	}
-
-	PCIE_INFO("[-]\n");
 	return ret;
 }
+
 #else
-int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
+int skw_pcie_bind_bt_driver(struct pci_dev *pci_dev)
 {
 	struct platform_device *pdev;
 	char	pdev_name[32];
 	struct edma_port *port;
 	int ret = 0;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct device *parent_dev = &priv->dev->dev;
 
-	PCIE_INFO("[+]\n");
+	PCIE_INFO("[-]\n");
 	sprintf(pdev_name, "skw_ucom");
 /*
  *	creaete BT DATA device
@@ -1770,7 +1623,7 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "BTDATA";
@@ -1778,21 +1631,19 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	memcpy(ucom_pdata.chipid, priv->chip_id, SKW_CHIP_ID_LENGTH);
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data \n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
 		platform_device_put(pdev);
 		return ret;
 	}
-
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
+		platform_device_put(pdev);
+		return ret;
+	}
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
 
 /*
  *	creaete BT COMMAND device
@@ -1800,14 +1651,20 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "BTCMD";
 	ucom_pdata.data_port = EDMA_BTCMD_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add %s device \n", ucom_pdata.port_name);
+		dev_err(&pci_dev->dev, "failed to add %s device \n", ucom_pdata.port_name);
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1815,13 +1672,6 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
 
 /*
  *	creaete BT audio device
@@ -1829,14 +1679,20 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "BTAUDIO";
 	ucom_pdata.data_port = EDMA_BTAUDIO_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data \n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1844,13 +1700,6 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
 
 /*
  *	creaete BT isoc  device
@@ -1858,14 +1707,20 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "BTISOC";
 	ucom_pdata.data_port = EDMA_ISOC_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data \n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1873,13 +1728,6 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
 
 /*
  *	creaete BT LOG  device
@@ -1887,14 +1735,20 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	pdev = platform_device_alloc(pdev_name, PLATFORM_DEVID_AUTO);
 	if(!pdev)
 		return -ENOMEM;
-	pdev->dev.parent = parent_dev;
+	pdev->dev.parent = &pci_dev->dev;
 	pdev->dev.dma_mask = &port_dmamask;
 	pdev->dev.coherent_dma_mask = port_dmamask;
 	ucom_pdata.port_name = "BTLOG";
 	ucom_pdata.data_port = EDMA_BTLOG_PORT;
 	ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 	if(ret) {
-		PCIE_ERR("failed to add platform data \n");
+		dev_err(&pci_dev->dev, "failed to add platform data \n");
+		platform_device_put(pdev);
+		return ret;
+	}
+	ret = platform_device_add(pdev);
+	if(ret) {
+		dev_err(&pci_dev->dev, "failt to register platform device\n");
 		platform_device_put(pdev);
 		return ret;
 	}
@@ -1902,27 +1756,18 @@ int skw_pcie_bind_bt_driver(struct platform_device *boot_dev)
 	port = &edma_ports[ucom_pdata.data_port];
 	port->pdev = pdev;
 	port->state = PORT_STATE_IDLE;
-
-	ret = platform_device_add(pdev);
-	if(ret) {
-		PCIE_ERR("failt to register platform device\n");
-		platform_device_put(pdev);
-		return ret;
-	}
-
-	PCIE_INFO("[-]\n");
 	return ret;
 }
 #endif
 
-int skw_pcie_unbind_wifi_driver(struct platform_device *boot_dev)
+int skw_pcie_unbind_wifi_driver(struct pci_dev *dev)
 {
 	int ret = 0;
 
 	return ret;
 }
 
-int skw_pcie_unbind_bt_driver(struct platform_device *boot_dev)
+int skw_pcie_unbind_bt_driver(struct pci_dev *dev)
 {
 	int ret = 0;
 
@@ -1932,11 +1777,11 @@ int skw_pcie_unbind_bt_driver(struct platform_device *boot_dev)
 int  skw_edma_init(void)
 {
 	int i;
-	struct wcn_pcie_info *priv = get_pcie_device_info();
+	struct wcn_pcie_info *priv;
 #ifdef CONFIG_SKW_MSI_AS_LEGACY
 	int val;
 #endif
-
+	priv = get_pcie_device_info();
 	if (priv->msix_en)
 		skw_pcie_write32(DMA_INT_TYPE_CFG, 0x2);
 	else if (priv->msi_en)
@@ -1950,7 +1795,6 @@ int  skw_edma_init(void)
 	skw_pcie_write32(DMA_SRC_RING_NODE_NUM, 0x3ff);
 
 	memset(&edma_chns_info[0], 0, sizeof(edma_chns_info));
-	memset(&edma_ports[0], 0, sizeof(edma_ports));
 	for (i = 0;i < MAX_EDMA_COUNT;i++) {
 		edma_chns_info[i].chn_id = i;
 #ifdef CONFIG_SKW_MSI_AS_LEGACY
@@ -1959,14 +1803,14 @@ int  skw_edma_init(void)
 		skw_pcie_write32(DMA_CFG(i), val);
 #endif
 	}
-
 	edma_spin_lock_init(priv);
 	skw_edma_wakeup_source_init();
 #ifdef CONFIG_BT_SEEKWAVE
-	//INIT_WORK(&priv->bt_rx_work, bt_rx_work);
+	INIT_WORK(&priv->bt_rx_work, bt_rx_work);
 #endif
 
-	mutex_init(&priv->close_mutex);
+	at_buffer = (char *)kzalloc(EDMA_PORT_BUFFER_SIZE, GFP_KERNEL);
+
 	return 0;
 }
 
@@ -2005,22 +1849,11 @@ void recovery_close_all_ports(void)
 
 	PCIE_INFO("[+]\n");
 	for(i=0; i<MAX_PORT_NUM;i++) {
-		PCIE_INFO("[+]portno=%d\n", i);
+		PCIE_DBG("portno=%d\n", i);
 		port = get_edma_port_info(i);
-#if !defined(CONFIG_BT_SEEKWAVE)
-		if (i <= EDMA_BTLOG_PORT) {//bt port
-			PCIE_INFO("port_sta_rec[%d]=%d, %d\n", i, port_sta_rec[i], completion_done(&port->rx_done));
-			if (port_sta_rec[i] == 1 && !completion_done(&port->rx_done)) {
-				complete(&port->rx_done);
-				if (i == EDMA_BTCMD_PORT)//for bt stop service pass before recovery in skw_boot.c
-					cp_exception_sts = 0;
-			}
-			continue;
-		}
-#endif
 		if(port->pdev)
 			close_edma_port(i);
-		PCIE_INFO("[-]portno=%d\n", i);
+		PCIE_DBG("portno=%d\n", i);
 	}
 	PCIE_INFO("[-]\n");
 }
@@ -2032,32 +1865,17 @@ int skw_pcie_unbind_port_driver(void)
 	struct wcn_pcie_info *priv = get_pcie_device_info();
 
 	PCIE_INFO("[+]\n");
-	if (priv->cp_state == CP_READY) {//remove driver
-		if (wifi_data_pdev != NULL) {
-			platform_device_unregister(wifi_data_pdev);
-			wifi_data_pdev = NULL;
-		}
-		PCIE_INFO("\n");
-#ifdef CONFIG_BT_SEEKWAVE
-		if (bt_data_pdev != NULL) {
-			platform_device_unregister(bt_data_pdev);
-			bt_data_pdev = NULL;
-		}
-		for(i=EDMA_LOOPCHECK_PORT; i<MAX_PORT_NUM;i++)
-#else
-		for(i=0; i<MAX_PORT_NUM;i++)
-#endif
-		{
-			PCIE_INFO("portno=%d\n", i);
-			port = get_edma_port_info(i);
-			if(port->pdev) {
+	platform_device_unregister(wifi_data_pdev);
+	PCIE_DBG("\n");
+	for(i=0; i<MAX_PORT_NUM;i++) {
+		PCIE_DBG("portno=%d\n", i);
+		port = get_edma_port_info(i);
+		if(port->pdev) {
+			if (priv->cp_state == 0) //not recovery
 				close_edma_port(i);
-				platform_device_unregister(port->pdev);
-			}
-			PCIE_INFO("portno=%d\n", i);
+			platform_device_unregister(port->pdev);
 		}
-	} else {
-		PCIE_INFO("cpsts:%s, recv no unbind driver\n", str_cpsts[priv->cp_state]);
+		PCIE_DBG("portno=%d\n", i);
 	}
 	PCIE_INFO("[-]\n");
 	return 0;
@@ -2066,16 +1884,11 @@ int skw_pcie_unbind_port_driver(void)
 void skw_edma_deinit(void)
 {
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	//struct edma_chn_info *edma_chp = get_edma_channel_info(6);
 
-	PCIE_INFO("[+]\n");
-#if 0
-	//kfree(at_buffer);
-	dma_free_coherent(&priv->dev->dev, PAGE_ALIGN(EDMA_PORT_BUFFER_SIZE),
-			at_buffer, edma_chp->hdr_dma_addr);
-#endif
+	PCIE_DBG("[+]\n");
+	kfree(at_buffer);
 	kfree(priv->spin_lock);
 	skw_edma_wakeup_source_destroy();
 	skw_pcie_unbind_port_driver();
-	PCIE_INFO("[-]\n");
+	PCIE_DBG("[-]\n");
 }

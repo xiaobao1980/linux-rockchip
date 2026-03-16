@@ -175,6 +175,8 @@ struct seekwave_device {
 	char *skw_nv_name;
 	char *iram_file_path;
 	char *dram_file_path;
+	char *img_data;
+	int  img_size;
 	int host_gpio;/*GPIO0_A3*/
 	int chip_gpio;/*GPIO2_D2*/
 	int chip_en;/*GPIO0_B1*/

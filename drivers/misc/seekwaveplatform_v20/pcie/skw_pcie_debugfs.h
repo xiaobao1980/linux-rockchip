@@ -8,16 +8,22 @@
 
 #include <linux/fs.h>
 #include <linux/debugfs.h>
-#include <linux/version.h>
-#include <linux/proc_fs.h>
-#include <linux/uaccess.h>
-#include <linux/seq_file.h>
-#include <linux/utsname.h>
-#include <generated/utsrelease.h>
+
+static inline int skw_pcie_default_open(struct inode *node, struct file *fp)
+{
+	fp->private_data = node->i_private;
+	return 0;
+}
+
+static inline void  skw_pcie_remove_debugfs(struct dentry *dentry)
+{
+	debugfs_remove(dentry);
+}
+
+struct dentry *skw_pcie_add_debugfs(const char *name, umode_t mode, void *data,
+				   const struct file_operations *fops);
 
 int skw_pcie_debugfs_init(void);
 void skw_pcie_debugfs_deinit(void);
-int skw_pcie_proc_init_ex(const char *name, umode_t mode, const void *fops,
-			  void *data);
 
 #endif

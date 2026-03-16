@@ -10,7 +10,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-#include "linux/workqueue.h"
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
 #include <linux/dma-mapping.h>
@@ -45,17 +44,13 @@ extern u32 last_sent_wifi_cmd[3];
 int skw_pcie_elbi_writeb(unsigned int address, unsigned char value);
 int skw_pcie_elbi_writed(unsigned int address, u32 value);
 static BLOCKING_NOTIFIER_HEAD(modem_notifier_list);
-static u8 port_assert_idx[7] = {
+static u8 port_assert_idx[5] = {
 	EDMA_AT_PORT,
 	EDMA_LOG_PORT,
 	EDMA_BTCMD_PORT,
 	EDMA_BTAUDIO_PORT,
-	EDMA_BTACL_PORT,
-	EDMA_ISOC_PORT,
-	EDMA_BTLOG_PORT,
+	EDMA_BTACL_PORT
 };
-
-char *str_cpsts[] = {"READY", "ASSERT", "DUMPDONE", "BLOCK"};
 
 void skw_pcie_setup_service_devices(void)
 {
@@ -68,7 +63,7 @@ void modem_unregister_notify(struct notifier_block *nb)
 {
 	blocking_notifier_chain_unregister(&modem_notifier_list, nb);
 }
-void modem_notify_event(int event)
+static void modem_notify_event(int event)
 {
 	blocking_notifier_call_chain(&modem_notifier_list, event, NULL);
 }
@@ -77,39 +72,32 @@ void skw_pcie_exception_work(struct work_struct *work)
 {
 	int i=0;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-
-	PCIE_INFO("[+]\n");
+	PCIE_INFO(" ENTER...\n");
 	mutex_lock(&priv->except_mutex);
-	if(priv->recovery_dis_state == 1) {//recovery disabled
-		PCIE_INFO("cpsts=%s\n", str_cpsts[priv->cp_state]);
-		PCIE_INFO("[-]Recovery disabled, exit exception\n");
+	if(priv->cp_state !=0)
+	{
+		PCIE_INFO("the assert coming!!\n");
 		mutex_unlock(&priv->except_mutex);
 		return;
 	}
-
-	if(priv->cp_state == CP_ASSERT)	{//assert
-		PCIE_INFO("[-]Assert handled before block, exit exception\n");
-		mutex_unlock(&priv->except_mutex);
-		return;
-	}
-	priv->cp_state = CP_BLOCK;
+	priv->cp_state = DEVICE_BLOCKED_EVENT;
 	mutex_unlock(&priv->except_mutex);
 	modem_notify_event(DEVICE_BLOCKED_EVENT);
-	for (i=0; i<MAX_PORT_NUM - 1; i++)
+	for (i=0; i<5; i++)
 	{
 		if(!edma_ports[port_assert_idx[i]].state || edma_ports[port_assert_idx[i]].state==PORT_STATE_CLSE)
 			continue;
 
-		edma_ports[port_assert_idx[i]].state = PORT_STATE_ASST;
+		edma_ports[i].state = PORT_STATE_ASST;
 	}
 	recovery_close_all_ports();
-	if (priv->chip_en >= 0) {
-		priv->service_state_map=0;
-		skw_recovery_mode();
-	} else {
-		PCIE_ERR("chip_en is not configured, CAN'T recovery, check \"MODEM_ENABLE_GPIO\" in boot_config.h!!!");
-	}
-	PCIE_INFO("[-]\n");
+	gpio_set_value(priv->chip_en, 0);
+	PCIE_INFO("recv:---- ----chipen=%d\n", gpio_get_value(priv->chip_en));
+	msleep(1000);
+	gpio_set_value(priv->chip_en, 1);
+	PCIE_INFO("recv:---- ----chipen=%d\n", gpio_get_value(priv->chip_en));
+	priv->service_state_map=0;
+	skw_recovery_mode();
 }
 
 /*skw_ap2cp_irq_reg bit4 modem assert*/
@@ -118,26 +106,21 @@ int send_modem_assert_command(void)
 	int ret =0;
 	u32 *cmd = last_sent_wifi_cmd;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	unsigned long flags;
 
-	spin_lock_irqsave(priv->spin_lock, flags);
-	dump_stack();
-	PCIE_INFO("[+], cpsts=%s\n", str_cpsts[priv->cp_state]);
-	if(priv->cp_state != CP_READY) {
-		spin_unlock_irqrestore(priv->spin_lock, flags);
+	PCIE_DBG(" ENTER !!!\n");
+	if(priv->cp_state)
 		return ret;
-	}
-	priv->cp_state=CP_BLOCK;
+
+	//priv->cp_state=1;/*cp except set value*/
 	ret =skw_pcie_elbi_writeb(SKW_AP2CP_IRQ_REG, 0x10);
-	PCIE_INFO("send assert CP CMD, ret=%d cmd: 0x%x 0x%x 0x%x\n", ret, cmd[0], cmd[1], cmd[2]);
+	PCIE_ERR("%s ret=%d cmd: 0x%x 0x%x 0x%x\n", __func__,
+			 ret, cmd[0], cmd[1], cmd[2]);
 #ifdef CONFIG_SEEKWAVE_PLD_RELEASE
 	schedule_delayed_work(&priv->skw_except_work , msecs_to_jiffies(2000));
 #else
 	if(!priv->recovery_dis_state)
 		schedule_delayed_work(&priv->skw_except_work , msecs_to_jiffies(6000));
 #endif
-	PCIE_INFO("[-]\n");
-	spin_unlock_irqrestore(priv->spin_lock, flags);
 	return ret;
 }
 
@@ -153,18 +136,18 @@ void check_dumpdone_work(struct work_struct *work)
 
 int skw_pcie_loopcheck_entry(void *para)
 {
-	struct wcn_pcie_info *priv = get_pcie_device_info();
+	struct wcn_pcie_info *skw_pcie;
 	int portno = *(int *)para;
-	int recv_flag = 0;
 	char *buffer;
 	int read, size;
-	int timeout = 100;
+	int count= 0, timeout=100;
 	int i;
 
 	PCIE_DBG("\n");
 	size = 512;
 	buffer = kzalloc(size, GFP_KERNEL);
-	while(loop_state && buffer) {
+	skw_pcie = get_pcie_device_info();
+	while(loop_state && buffer){
 		read = 0;
 		memset(buffer,0,size);
 		do {
@@ -179,82 +162,96 @@ int skw_pcie_loopcheck_entry(void *para)
 		}
 
 		PCIE_INFO("recv(%d): %s\n", read, buffer);
-
+#if 0
+		if(strncmp(buffer, "BSPREADY", read))
+			PCIE_INFO("recv(%d): %s\n", read, buffer);
+#endif
 		memcpy(buffer+256, "LOOPCHECK", 9);
 		if (read==8 && !strncmp(buffer, "BSPREADY", read)) {
 			PCIE_INFO("BSP READY!!!\n");
+			;//send_data(portno, buffer+256, 9);
 		} else if (read==9 && !strncmp(buffer, "WIFIREADY", read)) {
-			priv->service_state_map |=1;
-			complete(&priv->download_done);
+			skw_pcie->service_state_map |=1;
+			complete(&skw_pcie->download_done);
 			timeout=500;
+			PCIE_DBG("SEND THE LOOPCHECK CMD !!!\n");
+			send_data(portno, buffer+256, 9);
 		} else if (read==6 && !strncmp(buffer, "BTEXIT", read)) {
-			complete(&priv->download_done);
+			complete(&skw_pcie->download_done);
 		} else if (read==7 && !strncmp(buffer, "BTREADY", read)) {
-			priv->service_state_map |=2;
-			complete(&priv->download_done);
+			skw_pcie->service_state_map |=2;
+			complete(&skw_pcie->download_done);
+			send_data(portno, buffer+256, 9);
 		} else if (!strncmp(buffer, "BSPASSERT", 9)) {
-			PCIE_INFO("BSP ASSERT!!!\n");
-			if(priv->cp_state == CP_BLOCK && delayed_work_pending(&priv->skw_except_work)) {
-				cancel_delayed_work_sync(&priv->skw_except_work);
-				PCIE_INFO("Cancel exception work\n");
+			if(skw_pcie->cp_state==1)
+				cancel_delayed_work_sync(&skw_pcie->skw_except_work);
+
+			mutex_lock(&skw_pcie->except_mutex);
+			if(skw_pcie->cp_state == DEVICE_BLOCKED_EVENT){
+				mutex_unlock(&skw_pcie->except_mutex);
+				break;
 			}
-			priv->cp_state = CP_ASSERT;//assert
+			skw_pcie->cp_state = 1;//TODO
+			mutex_unlock(&skw_pcie->except_mutex);
+
 			memset(buffer, 0, read);
 			modem_status = MODEM_HALT;
 			//show_assert_context();
 			modem_notify_event(DEVICE_ASSERT_EVENT);
-			if (get_log_enable_status() == 1) {
-				if(edma_ports[EDMA_LOG_PORT].state == PORT_STATE_OPEN) {
-					schedule_delayed_work(&priv->check_dumpdone_work , msecs_to_jiffies(5000));
-					read = recv_data(portno, buffer, 256);
-					cancel_delayed_work_sync(&priv->check_dumpdone_work);
-					PCIE_INFO("wait 5s to dump assert log ...\n");
-					msleep(5000);//wait for CP finishing dump log
-				}
+#ifndef CONFIG_SEEKWAVE_PLD_RELEASE
+			if(edma_ports[EDMA_LOG_PORT].state == PORT_STATE_OPEN) {
+				schedule_delayed_work(&skw_pcie->check_dumpdone_work , msecs_to_jiffies(5000));
+				read = recv_data(portno, buffer, 256);
+				cancel_delayed_work_sync(&skw_pcie->check_dumpdone_work);
+				PCIE_INFO(" bspassert after recv(%d): %s\n", read, buffer);
+				msleep(5000);//wait for CP to dump assert log
 			}
+#endif
 			modem_notify_event(DEVICE_DUMPDONE_EVENT);
 
-			for (i=0; i<MAX_PORT_NUM - 1; i++) {
+			for (i=0; i<5; i++) {
 				if((edma_ports[port_assert_idx[i]].state == PORT_STATE_IDLE) ||
 							(edma_ports[port_assert_idx[i]].state==PORT_STATE_CLSE))
 					continue;
 				edma_ports[port_assert_idx[i]].state = PORT_STATE_ASST;
 			}
 
-			if(priv->recovery_dis_state) {
-				PCIE_INFO("recovery disable, no need to recovery\n");
+			if(skw_pcie->recovery_dis_state)
 				break;
-			}
 
 			recovery_close_all_ports();
-			if (priv->chip_en >= 0)
-				recv_flag = 1;
-			else
-				PCIE_ERR("chip_en is not configured, CAN'T recovery, check \"MODEM_ENABLE_GPIO\" in boot_config.h!!!");
+			PCIE_INFO("recv(%d):---- %s----chipen=%d\n", read, buffer, skw_pcie->chip_en);
+			gpio_set_value(skw_pcie->chip_en, 0);
+			PCIE_INFO("recv:---- ----chipen=%d\n", gpio_get_value(skw_pcie->chip_en));
+			msleep(1000);
+			gpio_set_value(skw_pcie->chip_en, 1);
+			PCIE_INFO("recv:---- ----chipen=%d\n", gpio_get_value(skw_pcie->chip_en));
+			schedule_delayed_work(&skw_pcie->skw_pcie_recovery_work , msecs_to_jiffies(2000));
+			//skw_recovery_mode();
+			//PCIE rescan bus
 			break;
 		} else if (!strncmp("trunk_W", buffer, 7)) {
-			complete(&priv->download_done);
-			priv->cp_state = CP_READY;
+			//if(!skw_pcie->cp_state)
+			complete(&skw_pcie->download_done);
+
+			//assert_info_print = 0;
+			skw_pcie->cp_state = 0;
 			modem_status = MODEM_ON;
 			memset(firmware_version, 0 , sizeof(firmware_version));
 			strncpy(firmware_version, buffer, read);
 			PCIE_DBG("---debug---,@@Line:%d, Func:%s@@\n", __LINE__, __func__);
 			modem_notify_event(DEVICE_BSPREADY_EVENT);
 			PCIE_DBG("---debug---,@@Line:%d, Func:%s@@\n", __LINE__, __func__);
+
+			count = 0;
 			skw_pcie_setup_service_devices();
-		} else {
-			PCIE_INFO("loopcheck receive string error!!!\n");
 		}
 		msleep(timeout);
 	}
-
 	PCIE_INFO("loopcheck thread is exit\n");
+
 	kfree(buffer);
 	up(&loop_sem);
-	if (recv_flag == 1) {
-		schedule_delayed_work(&priv->skw_pcie_recovery_work , msecs_to_jiffies(100));
-		recv_flag = 0;
-	}
 	return 0;
 }
 
@@ -262,21 +259,19 @@ int skw_pcie_create_loopcheck_thread(int portno)
 {
 	int ret;
 
-	PCIE_INFO("[+]\n");
 	loop_thread = NULL;
 	modem_status = MODEM_OFF;
 	loop_state = 0;
 	ret = open_edma_port(portno, NULL, NULL);
 	if (ret==0) {
 		loop_portno = portno;
-		loop_thread = kthread_create(skw_pcie_loopcheck_entry, &loop_portno, "Loopcheck");
+		loop_thread = kthread_create(skw_pcie_loopcheck_entry, &loop_portno, "LOOP");
 	}
 	if(loop_thread) {
 		loop_state = 1;
 		sema_init(&loop_sem, 0);
 		wake_up_process(loop_thread);
 	}
-	PCIE_INFO("[-]\n");
 	return 0;
 }
 
@@ -291,7 +286,6 @@ int skw_pcie_remove_loopcheck_thread(int portno)
 {
 	int ret;
 
-	PCIE_INFO("[+]\n");
 	if (loop_state && loop_thread) {
 		loop_state = 0;
 		//close_edma_port(portno);
@@ -299,6 +293,5 @@ int skw_pcie_remove_loopcheck_thread(int portno)
 		if (ret==0)
 			loop_thread = NULL;
 	}
-	PCIE_INFO("[-]\n");
 	return 0;
 }

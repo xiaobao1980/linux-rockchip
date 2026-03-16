@@ -14,13 +14,11 @@
 #include "skw_log_to_file.h"
 #define UCOM_PORTNO_MAX		13
 #define UCOM_DEV_PM_OPS NULL
-
 int cp_exception_sts=0;
-static int log_start;
-static unsigned int tmp_chipid = 0;
-static int log_portno = 0;
+unsigned int tmp_chipid = 0;
+extern int skw_reset_bootloader_cp(void);
+//extern int skw_get_chipid(char *chip_id);
 static int	skw_major = 0;
-struct mutex ucom_mutex;
 static struct class *skw_com_class = NULL;
 struct ucom_dev	{
 	atomic_t open;
@@ -37,15 +35,83 @@ struct ucom_dev	{
 	struct notifier_block notifier;
 };
 static struct ucom_dev *ucoms[UCOM_PORTNO_MAX];
-static char *dump_memory_buffer;
-static int  dump_buffer_size, dump_log_size;
-#include "skw_dump_mem.c"
+
+static int bt_state_event_notifier(struct notifier_block *nb, unsigned long action, void *data)
+{
+	//int ret = 0;
+	skwboot_log("%s event = %d\n", __func__, (int)action);
+	switch(action)
+	{
+		case DEVICE_ASSERT_EVENT:
+		{
+			skwboot_log("BT BSPASSERT EVENT Comming in !!!!\n");
+			cp_exception_sts = 1;
+		}
+		break;
+		case DEVICE_BSPREADY_EVENT:
+		{
+			cp_exception_sts = 0;
+			skwboot_log("BT BSPREADY EVENT Comming in !!!!\n");
+		}
+		break;
+		case DEVICE_DUMPDONE_EVENT:
+		{
+			cp_exception_sts = 2;
+			skwboot_log("BT DUMPDONE EVENT Comming in !!!!\n");
+		}
+		break;
+		case DEVICE_BLOCKED_EVENT:
+		{
+			cp_exception_sts = 3;
+			skwboot_log("BT BLOCKED EVENT Comming in !!!!\n");
+		}
+		break;
+		default:
+		{
+			cp_exception_sts = action;
+		}
+		break;
+
+	}
+	return NOTIFY_OK;
+}
+
+static int skw_bt_state_event_init(struct ucom_dev *ucom)
+{
+	int ret = 0;
+	skwlog_log("%s enter  \n",__func__);
+	if (ucom->pdata->modem_register_notify && ucom->notifier.notifier_call == NULL) {
+		ucom->notifier.notifier_call = bt_state_event_notifier;
+		ucom->pdata->modem_register_notify(&ucom->notifier);
+	}else{
+		skwlog_log("%s have registered !! %d  \n",__func__,__LINE__);
+	}
+
+	return ret;
+}
+
+static int skw_bt_state_event_deinit(struct ucom_dev *ucom)
+{
+	int ret = 0;
+	skwlog_log("%s enter  \n",__func__);
+	if(ucom) {
+		if((ucom->notifier.notifier_call)){
+			skwboot_log("%s :%d release the notifier \n", __func__,__LINE__);
+			ucom->notifier.notifier_call = NULL;
+			ucom->pdata->modem_unregister_notify(&ucom->notifier);
+		}
+	}
+	return ret;
+}
 
 static int user_boot_open(struct inode *ip, struct file *fp)
 {
 	struct cdev *char_dev;
 	int ret = -EIO, i;
 	struct ucom_dev *ucom=NULL;
+	int count=100;
+	while(cp_exception_sts &&count--)
+		msleep(10);
 
 	char_dev = ip->i_cdev;
 	for(i=0; i< UCOM_PORTNO_MAX; i++) {
@@ -56,18 +122,14 @@ static int user_boot_open(struct inode *ip, struct file *fp)
 		}
 	}
 
-	if(cp_exception_sts)
-		ret = -EIO;
 	if(ucom && !cp_exception_sts) {
 		if(atomic_read(&ucom->open))
 			return -EBUSY;
+		atomic_inc(&ucom->open);
+		fp->private_data = ucom;
 		if(!cp_exception_sts)
 			ret=ucom->pdata->open_port(ucom->portno, NULL, NULL);
 
-		if (ret == 0) {
-			atomic_inc(&ucom->open);
-			fp->private_data = ucom;
-		}
 		printk("Open user_boot device: 0x%x task %d\n", char_dev->dev, (int)current->pid);
 	}
 	skwboot_log("%s line:%d the Enter \n", __func__,__LINE__);
@@ -103,7 +165,10 @@ static int ucom_open(struct inode *ip, struct file *fp)
 	int ret = -EIO, i;
 	struct ucom_dev *ucom=NULL;
 	unsigned long arg=0;
-
+	if(cp_exception_sts){
+		skwboot_log("%s line:%d the modem assert \n", __func__,__LINE__);
+		return ret;
+	}
 	char_dev = ip->i_cdev;
 	for(i=0; i< UCOM_PORTNO_MAX; i++) {
 		if(ucoms[i] && (ucoms[i]->devno == char_dev->dev)) {
@@ -113,21 +178,15 @@ static int ucom_open(struct inode *ip, struct file *fp)
 		}
 	}
 
-	if(cp_exception_sts && strncmp(ucom->pdata->port_name, "LOG", 3)){
-		skwboot_log("%s line:%d the modem assert \n", __func__,__LINE__);
-		return -EIO;
-	}
 	if(ucom) {
 		if(atomic_read(&ucom->open) > 1){
 			printk("%s ,%d\n", __func__, __LINE__);
 			return -EBUSY;
 		}
 		atomic_inc(&ucom->open);
-		if (atomic_read(&ucom->open)==1) {
-			init_waitqueue_head(&ucom->wq);
-			spin_lock_init(&ucom->lock);
-			ucom->pdata->open_port(ucom->portno, NULL, NULL);
-		}
+		init_waitqueue_head(&ucom->wq);
+		spin_lock_init(&ucom->lock);
+		ucom->pdata->open_port(ucom->portno, NULL, NULL);
 		fp->private_data = ucom;
 		printk("%s: ucom[%d] %s(0x%x)\n", __func__, i, ucom->pdata->port_name, ucom->portno);
 
@@ -141,6 +200,7 @@ static int ucom_open(struct inode *ip, struct file *fp)
 
 	return ret;
 }
+
 static int ucom_release(struct inode *ip, struct file *fp)
 {
 	struct ucom_dev *ucom = fp->private_data;
@@ -155,15 +215,9 @@ static int ucom_release(struct inode *ip, struct file *fp)
 		printk("%s: ucom%p %s(0x%x)\n", __func__, ucom, ucom->pdata->port_name, ucom->devno);
 		if (atomic_read(&ucom->open)) {
 			atomic_dec(&ucom->open);
-			if(atomic_read(&ucom->open)==0) {
-				// Don't close LOG/AT port once open it, otherwise RX transfer lost.
-				if (strncmp(ucom->pdata->port_name, "LOG", 3) &&
-				    strncmp(ucom->pdata->port_name, "ATC", 3))
-					ucom->pdata->close_port(ucom->portno);
-				else if (!log_start && !strncmp(ucom->pdata->port_name, "LOG", 3))
-					ucom->pdata->close_port(ucom->portno);
-				wake_up(&ucom->wq);
-			}
+			if(strncmp(ucom->pdata->port_name, "LOG", 3) && strncmp(ucom->pdata->port_name, "ATC", 3))
+				ucom->pdata->close_port(ucom->portno);
+			wake_up(&ucom->wq);
 		} else
 			kfree(ucom);
 	}
@@ -178,15 +232,8 @@ static ssize_t ucom_read(struct file *fp, char __user *buf, size_t count, loff_t
 	unsigned long flags;
 	uint32_t *data;
 
-	if(atomic_read(&ucom->open)==0)
+	if(cp_exception_sts || atomic_read(&ucom->open)==0)
 		return -EIO;
-	if (strncmp(ucom->pdata->port_name, "LOG", 3) && cp_exception_sts)
-		return -EIO;
-
-	if (!strncmp(ucom->pdata->port_name, "LOG", 3) && dump_log_size) {
-		return skw_ucom_dump_from_buffer(buf, count, pos);
-	}
-
 	spin_lock_irqsave(&ucom->lock, flags);
 	if(ucom->rx_busy) {
 		spin_unlock_irqrestore(&ucom->lock, flags);
@@ -239,16 +286,14 @@ static ssize_t ucom_write(struct file *fp, const char __user *buf, size_t count,
 		if(copy_from_user(ucom->tx_buf, buf, size))
 			return -EFAULT;
 
-		if(ucom->pdata->port_name && !strncmp(ucom->pdata->port_name, "LOG", 3)){
+		if(!strncmp(ucom->pdata->port_name, "LOG", 3)){
 			if(!strncmp(ucom->tx_buf, "START", 5)){
 				skwboot_log("%s START log to file \n", __func__);
-				log_start = skw_modem_log_init(ucom->pdata, NULL, (void *)ucom);
-
+				skw_modem_log_init(ucom->pdata, NULL, (void *)ucom);
 			}
 			else if(!strncmp(ucom->tx_buf, "STOP", 4)){
 				skwboot_log("%s STOP log to file \n", __func__);
 				skw_modem_log_exit();
-				log_start = 0;
 			}
 			else
 				skwboot_log("%s LOG write string:%s \n", __func__, ucom->tx_buf);
@@ -286,7 +331,7 @@ static long ucom_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 	}
 	if((i<UCOM_PORTNO_MAX) && atomic_read(&ucom->open)) {
 		printk("%s ucom_%p rx_busy=%d\n", __func__, ucom, ucom->rx_busy);
-		if (ucom->pdata && ucom->rx_busy)
+		if (ucom->pdata)
 			ucom->pdata->close_port(ucom->portno);
 	}
 	return 0;
@@ -383,7 +428,6 @@ static int skw_ucom_probe(struct platform_device *pdev)
 	struct ucom_dev	*ucom;
 	int ret = 0;
 
-	mutex_lock(&ucom_mutex);
 	if(skw_com_class == NULL) {
 		skw_com_class = class_create(THIS_MODULE, "btcom");
 		if(IS_ERR(skw_com_class)) {
@@ -392,8 +436,6 @@ static int skw_ucom_probe(struct platform_device *pdev)
 			return ret;
 		}
 	}
-	mutex_unlock(&ucom_mutex);
-
 	if (pdata) {
 		ucom = kzalloc(sizeof(struct ucom_dev), GFP_KERNEL);
 		if(!ucom)
@@ -434,13 +476,10 @@ static int skw_ucom_probe(struct platform_device *pdev)
 		platform_set_drvdata(pdev, ucom);
 		ucoms[ucom->portno] = ucom;
 		device_create(skw_com_class, NULL, ucom->devno, NULL, "%s", pdata->port_name);
-		if(!strncmp(ucom->pdata->port_name, "ATC", 3))
-			skw_bt_state_event_init(ucom);
-		if (!strncmp(ucom->pdata->port_name, "LOG", 3)) {
-			log_portno = ucom->portno;
-#ifndef CONFIG_SEEKWAVE_PLD_RELEASE
-			log_start = skw_modem_log_init(ucom->pdata, NULL, (void *)ucom);
-#endif
+		if(ucom){
+			if(!strncmp(ucom->pdata->port_name, "BTCMD", 5)){
+				skw_bt_state_event_init(ucom);
+			}
 		}
 		return 0;
 	}
@@ -456,23 +495,16 @@ static int skw_ucom_remove(struct platform_device *pdev)
 	int devno;
 
 	ucom = platform_get_drvdata(pdev);
-	if(ucom) {
-		if(!strncmp(ucom->pdata->port_name, "LOG", 3)) {
-			skw_modem_log_exit();
-			log_start = 0;
-		}
+	if(!strncmp(ucom->pdata->port_name, "LOG", 3))
+		skw_modem_log_exit();
 
+	if(ucom) {
 		if(!strncmp(ucom->pdata->port_name, "BTCMD", 5)) {
 			if (ucom->rx_busy && ucom->pdata) {
 				ucom->pdata->close_port(ucom->portno);
 			}
-			//skw_bt_state_event_deinit(ucom);
-			cp_exception_sts = 0;
-		}
-
-		if(!strncmp(ucom->pdata->port_name, "ATC", 3))
 			skw_bt_state_event_deinit(ucom);
-
+		}
 		ret = wait_event_interruptible_timeout(ucom->wq,
 				(!atomic_read(&ucom->open)),
 				msecs_to_jiffies(1000));
@@ -517,20 +549,13 @@ static struct platform_driver skw_ucom_driver = {
 
 int skw_ucom_init(void)
 {
-	dump_log_size = 0;
-	log_start = 0;  
-	mutex_init(&ucom_mutex);
+
 	platform_driver_register(&skw_ucom_driver);
 	return 0;
 }
 
 void skw_ucom_exit(void)
 {
-	if (dump_memory_buffer)
-		kfree(dump_memory_buffer);
-	dump_memory_buffer  = NULL;
-	dump_log_size = 0;
 	cp_exception_sts=0;
-	mutex_destroy(&ucom_mutex);
 	platform_driver_unregister(&skw_ucom_driver);
 }

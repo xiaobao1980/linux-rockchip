@@ -26,7 +26,6 @@
 #define MODEM_ASSERT_TIMEOUT_VALUE  2*HZ
 #define MAX_SG_COUNT	100
 #define SDIO_BUFFER_SIZE	(16*1024)
-#define FRAGSZ_SIZE (3*1024)
 #define MAX_FIRMWARE_SIZE 256
 #define PORT_STATE_IDLE	0
 #define PORT_STATE_OPEN	1
@@ -60,6 +59,9 @@ struct sdio_port sdio_ports[SDIO2_MAX_CH_NUM];
 static u8 cp_fifo_status;
 struct debug_vars debug_infos;
 static BLOCKING_NOTIFIER_HEAD(modem_notifier_list);
+#if KERNEL_VERSION(4,4,0) <= LINUX_VERSION_CODE
+static DEFINE_PER_CPU(struct page_frag_cache, skw_sdio_alloc_cache);
+#endif
 unsigned int crc_16_l_calc(char *buf_ptr,unsigned int len);
 static int skw_sdio_rx_port_follow_ctl(int portno, int rx_fctl);
 //add the crc api the same as cp crc_16 api
@@ -73,7 +75,7 @@ char skw_cp_ver = SKW_SDIO_V10;
 int max_ch_num = MAX_CH_NUM;
 int max_pac_size = MAX_PAC_SIZE;
 int skw_sdio_blk_size = 256;
-static u8 is_timeout_kick;
+
 #ifdef CONFIG_PRINTK_TIME_FROM_ARM_ARCH_TIMER
 #include <clocksource/arm_arch_timer.h>
 u64 skw_local_clock(void)
@@ -143,34 +145,10 @@ void skw_get_sdio_debug_info(char *buffer, int size)
 	int j = 0;
 	u64 ts;
 	unsigned long rem_nsec;
-	u32 irq_cnt = 0;
-	struct skw_sdio_data_t *skw_sdio = skw_sdio_get_data();
 
 	if(!buffer) {
 		skw_sdio_info("buffer is null!\n");
 		return;
-	}
-
-	if (0 == debug_infos.rx_irq_statistics_cnt) {
-		if (SKW_SDIO_EXTERNAL_IRQ == skw_sdio->irq_type)
-			debug_infos.rx_irq_statistics_cnt = debug_infos.rx_gpio_irq_cnt;
-		else
-			debug_infos.rx_irq_statistics_cnt = debug_infos.rx_inband_irq_cnt;
-		debug_infos.rx_irq_statistics_time = skw_local_clock();
-		skw_sdio_info("===============rx irq statistics start:%d!===============\n", debug_infos.rx_irq_statistics_cnt);
-	} else {
-		ret += sprintf(&buffer[ret], "rx irq statistics:\n");
-		ts = skw_local_clock() - debug_infos.rx_irq_statistics_time;
-		rem_nsec = do_div(ts, 1000000000);
-		if (SKW_SDIO_EXTERNAL_IRQ == skw_sdio->irq_type)
-			irq_cnt = debug_infos.rx_gpio_irq_cnt - debug_infos.rx_irq_statistics_cnt;
-		else
-			irq_cnt = debug_infos.rx_inband_irq_cnt - debug_infos.rx_irq_statistics_cnt;
-		skw_sdio_info("===============rx irq statistics end:%d!===============\n", debug_infos.rx_irq_statistics_cnt + irq_cnt);
-		ret += sprintf(&buffer[ret], "rx irq time: [%5lu.%06lu] count:%d count per second:%lu\n", (unsigned long)ts, rem_nsec / 1000, irq_cnt, (unsigned long)(irq_cnt / ts));
-
-		debug_infos.rx_irq_statistics_cnt = 0;
-		debug_infos.rx_irq_statistics_time = 0;
 	}
 
 	ret += sprintf(&buffer[ret], "channel irq times:\n");
@@ -231,7 +209,7 @@ void skw_get_port_statistic(char *buffer, int size)
 
 		if(!buffer)
 			return;
-		ret += sprintf(&buffer[ret], "%s", firmware_version);
+
 		for(i=0; i<SDIO2_MAX_CH_NUM; i++)
 		{
 			if(ret >= size)
@@ -428,33 +406,48 @@ void skw_sdio_exception_work(struct work_struct *work)
 	skw_recovery_mode();
 }
 
-static inline void *skw_sdio_alloc_frag(size_t fragsz, gfp_t gfp_mask)
+#if KERNEL_VERSION(4,14,0) <= LINUX_VERSION_CODE
+static void *skw_sdio_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
 {
-	void *addr;
-	struct page *page;
-	addr = netdev_alloc_frag(fragsz);
-	if (!addr)
-		return NULL;
+	struct page_frag_cache *nc;
+	unsigned long flags;
+	void *data;
 
-	page = virt_to_head_page(addr);
-
-	skw_sdio_dbg(
-		"dbg: alloc addr: 0x%lx, size: %ld, page addr: 0x%lx, ref: %d\n",
-		(long)addr, (long int)fragsz, (long)page, page_count(page));
-
-	return addr;
+	local_irq_save(flags);
+	nc = this_cpu_ptr(&skw_sdio_alloc_cache);
+	data = page_frag_alloc(nc, fragsz, gfp_mask);
+	local_irq_restore(flags);
+	return data;
 }
-static inline void skw_page_frag_free(void *addr)
+#elif KERNEL_VERSION(4,4,0) > LINUX_VERSION_CODE
+static void *skw_sdio_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
 {
-	struct page *page = virt_to_head_page(addr);
-	skw_sdio_dbg("dbg: free addr: 0x%lx, page addr: 0x%lx, ref: %d\n",
-		     (long)addr, (long)page, page_count(page));
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
-	skb_free_frag(addr);
+	void *data;
+	data = netdev_alloc_frag(fragsz);
+	return data;
+}
+static void page_frag_free(void *data)
+{
+ 	put_page(virt_to_head_page(data));
+}
+
 #else
-	put_page(virt_to_head_page(addr));
-#endif
+static void *skw_sdio_alloc_frag(unsigned int fragsz, gfp_t gfp_mask)
+{
+	struct page_frag_cache *nc;
+	unsigned long flags;
+	void *data;
+	
+	local_irq_save(flags);
+	nc = this_cpu_ptr(&skw_sdio_alloc_cache);
+	data = __alloc_page_frag(nc, fragsz, gfp_mask);
+	local_irq_restore(flags);
+	return data;
 }
+#if KERNEL_VERSION(4,4,94) <= LINUX_VERSION_CODE
+	#define page_frag_free __free_page_frag
+#endif
+#endif
 
 static void skw_sdio_rx_down(struct skw_sdio_data_t * skw_sdio)
 {
@@ -589,14 +582,13 @@ static int skw_sdio_handle_packet(struct skw_sdio_data_t *skw_sdio,
 		} else if (!strncmp((char *)cmd, "BSPASSERT", 9)){
 			debug_infos.cp_assert_time = skw_local_clock();
 			skw_sdio_channel_record_disable_all();
-			sprintf(firmware_version, "%s:%s\n", firmware_version, cmd);
 			if(!skw_sdio->cp_state)
 				schedule_delayed_work(&skw_sdio->skw_except_work , msecs_to_jiffies(8000));
 
 			mutex_lock(&skw_sdio->except_mutex);
 			if(skw_sdio->cp_state==DEVICE_BLOCKED_EVENT){
 				if(skw_sdio->adma_rx_enable)
-					skw_page_frag_free(header);
+					page_frag_free(header);
 
 				mutex_unlock(&skw_sdio->except_mutex);
 				return 0;
@@ -612,7 +604,7 @@ static int skw_sdio_handle_packet(struct skw_sdio_data_t *skw_sdio,
 			mutex_lock(&skw_sdio->except_mutex);
 			if(skw_sdio->cp_state==DEVICE_BLOCKED_EVENT){
 				if(skw_sdio->adma_rx_enable)
-					skw_page_frag_free(header);
+					page_frag_free(header);
 
 				mutex_unlock(&skw_sdio->except_mutex);
 				return 0;
@@ -677,14 +669,14 @@ static int skw_sdio_handle_packet(struct skw_sdio_data_t *skw_sdio,
 		}
 		skw_sdio_dbg("Line:%d the port=%d \n", __LINE__, port->channel);
 		if(skw_sdio->adma_rx_enable)
-			skw_page_frag_free(header);
+			page_frag_free(header);
 		return 0;
 	}
 	if(!port->state) {
 		if(skw_sdio->adma_rx_enable){
 			if (!IS_LOG_PORT(portno))
 				skw_sdio_err("port%d discard data for wrong state\n", portno);
-			skw_page_frag_free(header);
+			page_frag_free(header);
 			return 0;
 		}
 	}
@@ -706,7 +698,7 @@ static int skw_sdio_handle_packet(struct skw_sdio_data_t *skw_sdio,
 			skw_sdio_err("portno:%d, packet lost recv seqno=%d expected %d\n", port->channel,
 					data[2] & 0xffff, port->next_seqno);
 			if(skw_sdio->adma_rx_enable)
-				skw_page_frag_free(header);
+				page_frag_free(header);
 			mutex_unlock(&port->rx_mutex);
 			return 0;
 		}
@@ -760,12 +752,12 @@ static int skw_sdio_handle_packet(struct skw_sdio_data_t *skw_sdio,
 			mutex_unlock(&port->rx_mutex);
 			complete(&port->rx_done);
 			if(skw_sdio->adma_rx_enable)
-				skw_page_frag_free(header);
+				page_frag_free(header);
 			return 0;
 		}
 		mutex_unlock(&port->rx_mutex);
 		if(skw_sdio->adma_rx_enable)
-			skw_page_frag_free(header);
+			page_frag_free(header);
 	}
 	return 0;
 }
@@ -800,17 +792,16 @@ static int skw_sdio2_handle_packet(struct skw_sdio_data_t *skw_sdio,
 			//kernel_restart(0);
 			skw_sdio->device_active = 1;
 			complete(&skw_sdio->download_done);
-		} else if (!strncmp((char *)cmd, "BSPASSERT", 9)) {
+		} else if (header->len==21 && !strncmp((char *)cmd, "BSPASSERT", 9)) {
 			debug_infos.cp_assert_time = skw_local_clock();
 			skw_sdio_channel_record_disable_all();
-			sprintf(firmware_version, "%s:%s\n", firmware_version, cmd);
 			if(!skw_sdio->cp_state &&(!strncmp((char *)skw_sdio->chip_id,"SV6160",6)))
 				schedule_delayed_work(&skw_sdio->skw_except_work , msecs_to_jiffies(12000));
 
 			mutex_lock(&skw_sdio->except_mutex);
 			if(skw_sdio->cp_state==DEVICE_BLOCKED_EVENT){
 				if(skw_sdio->adma_rx_enable)
-					skw_page_frag_free(header);
+					page_frag_free(header);
 
 				mutex_unlock(&skw_sdio->except_mutex);
 				return 0;
@@ -826,7 +817,7 @@ static int skw_sdio2_handle_packet(struct skw_sdio_data_t *skw_sdio,
 			mutex_lock(&skw_sdio->except_mutex);
 			if(skw_sdio->cp_state==DEVICE_BLOCKED_EVENT){
 				if(skw_sdio->adma_rx_enable)
-					skw_page_frag_free(header);
+					page_frag_free(header);
 
 				mutex_unlock(&skw_sdio->except_mutex);
 				return 0;
@@ -870,14 +861,12 @@ static int skw_sdio2_handle_packet(struct skw_sdio_data_t *skw_sdio,
 				skw_sdio->cp_detect_sleep_mode = cmd[4] - 0x30;
 			else
 				skw_sdio->cp_detect_sleep_mode = 4;
+			if(!skw_sdio->cp_state)
+				complete(&skw_sdio->download_done);
 
 			if(!skw_sdio->boot_data->first_dl_flag){
 				skw_sdio_gpio_irq_pre_ops();
 			}
-
-			if(!skw_sdio->cp_state)
-				complete(&skw_sdio->download_done);
-
 			if(skw_sdio->cp_state){
 				assert_info_print = 0;
 				if(sdio_ports[0].state == PORT_STATE_ASST)
@@ -893,7 +882,7 @@ static int skw_sdio2_handle_packet(struct skw_sdio_data_t *skw_sdio,
 		}
 		skw_sdio_dbg("Line:%d the port=%d \n", __LINE__, port->channel);
 		if(skw_sdio->adma_rx_enable)
-			skw_page_frag_free(header);
+			page_frag_free(header);
 		return 0;
 	}
 	//skw_sdio_info("Line:%d the port=%d \n", __LINE__, port->channel);
@@ -901,7 +890,7 @@ static int skw_sdio2_handle_packet(struct skw_sdio_data_t *skw_sdio,
 		if(skw_sdio->adma_rx_enable){
 			if (!IS_LOG_PORT(portno))
 				skw_sdio_err("port%d discard data for wrong state\n", portno);
-			skw_page_frag_free(header);
+			page_frag_free(header);
 			return 0;
 		}
 	}
@@ -968,12 +957,12 @@ static int skw_sdio2_handle_packet(struct skw_sdio_data_t *skw_sdio,
 			mutex_unlock(&port->rx_mutex);
 			complete(&port->rx_done);
 			if(skw_sdio->adma_rx_enable)
-				skw_page_frag_free(header);
+				page_frag_free(header);
 			return 0;
 		}
 		mutex_unlock(&port->rx_mutex);
 		if(skw_sdio->adma_rx_enable)
-			skw_page_frag_free(header);
+			page_frag_free(header);
 	}
 	return 0;
 }
@@ -1036,7 +1025,7 @@ static int skw_sdio_adma_parser(struct skw_sdio_data_t *skw_sdio, struct scatter
 				(header->len == 0)) {
 				skw_sdio_err("%s invalid header[%d]len[%d]: 0x%x 0x%x\n",
 						__func__,  header->channel, header->len, data[0], data[1]);
-				skw_page_frag_free(header);
+				page_frag_free(header);
 				continue;
 			}
 			skw_sdio->rx_packer_cnt++;
@@ -1051,7 +1040,7 @@ static int skw_sdio_adma_parser(struct skw_sdio_data_t *skw_sdio, struct scatter
 			skw_sdio_err("%s PUB HAEAD ERROR: packet[%d/%d] channel=%d,size=%d eof=%d!!!",
 					__func__, i, packet_count, channel, header->len, header->eof);
 #endif
-			skw_page_frag_free(header);
+			page_frag_free(header);
 			continue;
 		}
 	}
@@ -1093,7 +1082,7 @@ static int skw_sdio2_adma_parser(struct skw_sdio_data_t *skw_sdio, struct scatte
 				(header->len == 0)) {
 				skw_sdio_err("%s invalid header[%d]len[%d]: 0x%x 0x%x\n",
 						__func__,  header->channel, header->len, data[0], data[1]);
-				skw_page_frag_free(header);
+				page_frag_free(header);
 				continue;
 			}
 			skw_sdio->rx_packer_cnt++;
@@ -1107,7 +1096,7 @@ static int skw_sdio2_adma_parser(struct skw_sdio_data_t *skw_sdio, struct scatte
 			skw_sdio_err("%s PUB HAEAD ERROR: packet[%d/%d] channel=%d,size=%d eof=%d!!!",
 					__func__, i, packet_count, channel, header->len, header->eof);
 #endif
-			skw_page_frag_free(header);
+			page_frag_free(header);
 			continue;
 		}
 	}
@@ -1220,7 +1209,7 @@ struct scatterlist *skw_sdio_prepare_adma_buffer(struct skw_sdio_data_t *skw_sdi
 	struct scatterlist *sgs;
 	void	*buffer;
 	int	i, j, data_size;
-	int	alloc_size = FRAGSZ_SIZE;
+	int	alloc_size = PAGE_SIZE;
 
 	sgs = kzalloc((*sg_count) * sizeof(struct scatterlist), GFP_KERNEL);
 
@@ -1252,7 +1241,7 @@ struct scatterlist *skw_sdio_prepare_adma_buffer(struct skw_sdio_data_t *skw_sdi
 err:
 	skw_sdio_err("%s failed\n", __func__);
 	for(j=0; j<i; j++)
-		skw_page_frag_free(sg_virt(sgs + j));
+		page_frag_free(sg_virt(sgs + j));
 	kfree(sgs);
 	return NULL;
 
@@ -1267,7 +1256,6 @@ int skw_sdio_rx_thread(void *p)
 	unsigned int valid_len = 0;
 	char *rx_buf;
 	struct scatterlist *sgs = NULL;
-	unsigned char reg = 0;
 
 	skw_sdio_sdma_set_nsize(0);
 	skw_sdio_adma_set_packet_num(1);
@@ -1310,14 +1298,13 @@ int skw_sdio_rx_thread(void *p)
 					__LINE__,fifo_ind, cp_fifo_status, ret);
 			if (!ret && !fifo_ind)
 				skw_sdio_dbg("cp fifo ret -- %d \n", ret);
-			if(fifo_ind == cp_fifo_status && !is_timeout_kick) {
+			if(fifo_ind == cp_fifo_status) {
 				skw_sdio_info("line:%d cp fifo status(%d,%d) ret=%d\n",
 						__LINE__,fifo_ind, cp_fifo_status, ret);
 				skw_sdio_unlock_rx_ws(skw_sdio);
 				continue;
 			}
 		}
-		is_timeout_kick = 0;
 		cp_fifo_status = fifo_ind;
 receive_again:
 		if (skw_sdio->adma_rx_enable) {
@@ -1356,15 +1343,6 @@ receive_again:
 				}
 			}
 			rx_nsize =  *((uint32_t *)(skw_sdio->next_size_buf + (nsize_offset - 4)));
-			if (SKW_SDIO_INBAND_IRQ == skw_sdio->irq_type && rx_nsize == 0) {
-				ret = skw_sdio_readb(SDIO_INT_EXT, &reg);
-				if (ret < 0) {
-					skw_sdio_err("line %d sdio readb error ret=%d\n", __LINE__, ret);
-				} else {
-					skw_sdio_dbg("line %d SDIO_INT_EXT=0x%x\n", __LINE__, reg);
-				}
-			}
-
 			valid_len = *((uint32_t *)(skw_sdio->next_size_buf + (nsize_offset - 8)));
 			skw_sdio_dbg("line:%d total:%lld next_pac:%d:, valid len:%d cnt %d\n",
 					  __LINE__,skw_sdio->rx_packer_cnt, rx_nsize, valid_len, buf_num);
@@ -1398,14 +1376,6 @@ receive_again:
 				goto submit_packets;
 			}
 			rx_nsize = *((uint32_t *)(rx_buf + (alloc_size- 4)));
-			if (SKW_SDIO_INBAND_IRQ == skw_sdio->irq_type && rx_nsize == 0) {
-				ret = skw_sdio_readb(SDIO_INT_EXT, &reg);
-				if (ret < 0) {
-					skw_sdio_err("line %d sdio readb error ret=%d\n", __LINE__, ret);
-				} else {
-					skw_sdio_dbg("line %d SDIO_INT_EXT=0x%x\n", __LINE__, reg);
-				}
-			}
 			valid_len = *((uint32_t *)(rx_buf + (alloc_size - 8)));
 
 			skw_sdio_dbg("%s the sdma rx thread alloc_size:%d,read_len:%d,rx_nsize:%d,valid_len:%d\n",
@@ -1481,8 +1451,7 @@ void send_host_suspend_indication(struct skw_sdio_data_t *skw_sdio)
 {
 	uint32_t value = 0;
 	uint32_t timeout = 2000, timeout1 = 20;
-	if (skw_sdio->gpio_out >= 0 && skw_sdio->gpio_in >= 0 &&
-	    skw_sdio->resume_com) {
+	if(skw_sdio->gpio_out>=0 && skw_sdio->resume_com) {
 		skw_sdio_dbg("%s enter gpio=0\n", __func__);
 		skw_sdio->host_active = 0;
 		if (gpio_get_value(skw_sdio->gpio_in) == 0) {
@@ -1542,8 +1511,7 @@ int try_to_wakeup_modem(int portno)
 	unsigned long flags;
 	struct skw_sdio_data_t *skw_sdio = skw_sdio_get_data();
 
-	if (skw_sdio->gpio_out < 0 || skw_sdio->gpio_in < 0 ||
-	    skw_sdio->gpio_out == skw_sdio->gpio_in)
+	if(skw_sdio->gpio_out < 0)
 		return 0;
 	skw_sdio->device_active = gpio_get_value(skw_sdio->gpio_in);
 
@@ -1551,7 +1519,7 @@ int try_to_wakeup_modem(int portno)
 		return 0;
 	skw_reinit_completion(skw_sdio->device_wakeup);
 	skw_sdio->tx_req_map |= 1<<portno;
-	skw_sdio_dbg("%s enter gpio_val=%d : %d\n", __func__, skw_sdio->device_active, skw_sdio->resume_com);
+	//skw_sdio_info("%s enter gpio_val=%d : %d\n", __func__, skw_sdio->device_active, skw_sdio->resume_com);
 	skw_port_log(portno,"%s enter device_active=%d : %d\n", __func__, skw_sdio->device_active, skw_sdio->resume_com);
 	if(skw_sdio->device_active == 0) {
 		local_irq_save(flags);
@@ -1798,9 +1766,7 @@ static int send_data(int portno, char *buffer, int size)
 	struct sdio_port *port;
 	int ret, count, i;
 	u32 *data = (u32 *)buffer;
-	unsigned long timeout;
 
-	timeout = jiffies + msecs_to_jiffies(2000);
 	if(size==0)
 		return 0;
 	if(portno >= max_ch_num)
@@ -1854,10 +1820,6 @@ static int send_data(int portno, char *buffer, int size)
 		skw_sdio->tx_req_map &= ~(1<<portno);
 		skw_port_log(portno,"%s port%d size=%d 0x%x 0x%x\n",
 			__func__, portno, size, data[0], data[1]);
-		if (time_after(jiffies, timeout)) {
-			skw_sdio_info("line:%d sdma write timeout=%lld \n", __LINE__, jiffies_to_msecs(jiffies-timeout));
-			send_modem_assert_command();
-		}
 		return ret;
 	} else {
 		for(i=0; i<2; i++) {
@@ -1876,10 +1838,6 @@ static int send_data(int portno, char *buffer, int size)
 		skw_sdio->tx_req_map &= ~(1<<portno);
 		skw_port_log(portno,"%s port%d size=%d 0x%x 0x%x\n",
 			__func__, portno, size, data[0], data[1]);
-		if (time_after(jiffies, timeout)) {
-			skw_sdio_info("line:%d sdma write timeout=%lld \n", __LINE__, jiffies_to_msecs(jiffies-timeout));
-			send_modem_assert_command();
-		}
 		return ret;
 	}
 	return -ENOMEM;
@@ -2230,8 +2188,7 @@ void kick_rx_thread(void)
 	struct skw_sdio_data_t *skw_sdio = skw_sdio_get_data();
 
 	debug_infos.cmd_timeout_cnt++;
-	is_timeout_kick = 1;
-	if(skw_sdio->gpio_out < 0 || skw_sdio->gpio_in < 0) {
+	if(skw_sdio->gpio_out < 0) {
 		skw_sdio_rx_up(skw_sdio);
 	} else {
 		skw_sdio->device_active = gpio_get_value(skw_sdio->gpio_in);

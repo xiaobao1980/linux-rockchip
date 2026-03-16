@@ -40,7 +40,6 @@
 #include <linux/workqueue.h>
 #include <linux/scatterlist.h>
 #include <linux/platform_device.h>
-#include <linux/pci.h>
 #include "skw_mem_map.h"
 #include "skw_boot.h"
 #include "boot_config.h"
@@ -88,6 +87,8 @@ extern int skw_reset_bus_dev(void);
 static int skw_first_boot(struct seekwave_device *boot_data);
 static int skw_boot_init(struct seekwave_device *boot_data);
 static int skw_download_signal_ops(void);
+static int get_sleep_status(int portno, char *buffer, int size);
+static int set_sleep_status(int portno, char *buffer, int size);
 static int skw_start_bt_service(void);
 static int skw_stop_bt_service(void);
 /**************************sdio boot end********************************/
@@ -135,9 +136,8 @@ static int skw_request_firmwares(struct seekwave_device *boot_data,
 
 	skwboot_log("firmware: %s %s \n", dram_image_name, iram_image_name);
 	ret = request_firmware(&fw, dram_image_name, NULL);
-	if (ret < 0) {
+	if (ret) {
 		pr_err("request_firmware %s fail\n", dram_image_name);
-		ret = ENOENT;
 		goto ret;
 	}
 
@@ -162,8 +162,7 @@ static int skw_request_firmwares(struct seekwave_device *boot_data,
 	boot_data->dram_crc_val = crc_16_l_calc(boot_data->dram_img_data + boot_data->dram_crc_offset, boot_data->dram_dl_size);
 
 	ret = request_firmware(&fw, iram_image_name, NULL);
-	if (ret < 0) {
-		ret = ENOENT;
+	if (ret) {
 		pr_err("request_firmware %s fail ret %d\n", iram_image_name, ret);
 		if (fw == NULL) {
 			kfree(boot_data->dram_img_data);
@@ -181,9 +180,6 @@ static int skw_request_firmwares(struct seekwave_device *boot_data,
 	boot_data->iram_img_data = (char *)kzalloc(fw->size, GFP_KERNEL);
 	if (boot_data->iram_img_data == NULL) {
 		pr_err("alloc iram memory failed\n");
-		kfree(boot_data->dram_img_data);
-		boot_data->dram_img_data = NULL;
-		boot_data->dram_dl_size = 0;
 		ret = -ENOMEM;
 		goto relese_fw;
 	}
@@ -199,7 +195,7 @@ static int skw_request_firmwares(struct seekwave_device *boot_data,
 	skwboot_log("boot data iram_img_data %p\n",boot_data->iram_img_data);
 
 	ret = request_firmware(&fw, nv_mem_name, NULL);
-	if (ret < 0) {
+	if (ret) {
 		skwboot_err("request_firmware %s fail\n", nv_mem_name);
 		ret = 0;
 		goto ret;
@@ -208,12 +204,6 @@ static int skw_request_firmwares(struct seekwave_device *boot_data,
 	boot_data->nv_mem_data = (char *)kzalloc(fw->size, GFP_KERNEL);
 	if (boot_data->nv_mem_data == NULL) {
 		skwboot_err("alloc nv memory failed\n");
-		kfree(boot_data->iram_img_data);
-		boot_data->iram_img_data = NULL;
-		boot_data->iram_dl_size = 0;
-		kfree(boot_data->dram_img_data);
-		boot_data->dram_img_data = NULL;
-		boot_data->dram_dl_size = 0;
 		goto relese_fw;
 	}
 	memcpy(boot_data->nv_mem_data, fw->data, fw->size);
@@ -253,6 +243,17 @@ static int seekwave_boot_parse_dt(struct platform_device *pdev, struct seekwave_
 
 		skwboot_warn("no DTS setting\n");
 	} else {
+        /*-add the iram img file path dts-*/
+        ret = of_property_read_string(np, "skw_iram_path",(const char **)&(boot_data->iram_file_path));
+        if(ret < 0){
+            skwboot_err("%s:iram path fail ret=%d\n", __func__, ret);
+        }
+        /*-add the dram img file path dts-*/
+        ret = of_property_read_string(np, "skw_dram_path",(const char **)&(boot_data->dram_file_path));
+        if(ret < 0){
+            skwboot_err("%s: dram path fail ret=%d\n",__func__,ret);
+        }
+
         boot_data->host_gpio = of_get_named_gpio_flags(np, "gpio_host_wake", 0, &flags);
 		boot_data->chip_gpio = of_get_named_gpio_flags(np, "gpio_chip_wake",0, &flags);
 		boot_data->chip_en = of_get_named_gpio_flags(np, "gpio_chip_en",0, &flags);
@@ -260,10 +261,6 @@ static int seekwave_boot_parse_dt(struct platform_device *pdev, struct seekwave_
 		if(ret < 0){
 			skwboot_err("%s:nv name get fail ret=%d\n",__func__, ret);
 		}
-	}
-	if(test_debug==1){//test debug inband irq and nosleep en
-		boot_data->chip_gpio= -1;
-		boot_data->host_gpio= -1;
 	}
 	if (boot_data->host_gpio >= 0) {
 		ret = devm_gpio_request_one(&pdev->dev, boot_data->host_gpio, GPIOF_IN, "HOST_WAKE" );
@@ -275,10 +272,16 @@ static int seekwave_boot_parse_dt(struct platform_device *pdev, struct seekwave_
 			ret = devm_gpio_request_one(&pdev->dev, boot_data->chip_gpio, GPIOF_OUT_INIT_HIGH,"CHIP_WAKE");
 			if (ret < 0)
 				skwboot_err("%s:gpio_chip request fail ret=%d\n",__func__, ret);
+			else
+				gpio_set_value(boot_data->host_gpio, 1);
 
 		}
 	}
 
+	if(test_debug==1){//test debug inband irq and nosleep en
+		boot_data->chip_gpio= -1;
+		boot_data->host_gpio= -1;
+	}
 	if(boot_data->chip_gpio >= 0 && boot_data->host_gpio >=0){
 		boot_data->slp_disable = 0;
 	}else{
@@ -375,7 +378,7 @@ static int skw_iram_img_read(struct seekwave_device *boot_data)
 		if (IS_ERR(filep)) {
 			err = PTR_ERR(filep);
 			skwboot_err("open file error, err = %d\n", err);
-			goto fail1;
+			goto fail;
 		}
 		skwboot_log("file bin path = %s\n", boot_data->iram_file_path);
 	}
@@ -404,20 +407,29 @@ static int skw_iram_img_read(struct seekwave_device *boot_data)
 
 	boot_data->iram_img_data = (char *)kzalloc(boot_data->iram_dl_size, GFP_KERNEL);
 	if (boot_data->iram_img_data == NULL) {
-		goto fail;
+		goto fail1;
 	}
 	if (skw_read_file(filep, boot_data->iram_img_data,boot_data->iram_dl_size, &filep->f_pos) != boot_data->iram_dl_size) {
-		kfree(boot_data->iram_img_data);
-		boot_data->iram_img_data = NULL;
-		goto fail;
+		goto fail1;
 	}
+#if 0 //DEBUG
+	print_hex_dump(KERN_ERR, "img data ", 0, 16, 1,
+			boot_data->img_data, boot_data->img_size, 1);
+#endif
 	set_fs(old_fs);
 	filp_close(filep, NULL);
 	return 0;
 fail:
-	filp_close(filep, NULL);
-	skwboot_err("%s:  '%s' failed \n",__func__, boot_data->iram_file_path);
+	if (!IS_ERR(filep) && filep != NULL) {
+		filp_close(filep, NULL);
+		skwboot_err("%s: analysis the done - '%s' \n",__func__, boot_data->iram_file_path);
+	}
+	set_fs(old_fs);
+	return -3;
 fail1:
+	if (!IS_ERR(filep)){
+		filp_close(filep, NULL);
+	}
 	set_fs(old_fs);
 	return -1;
 }
@@ -456,7 +468,7 @@ static int skw_dram_img_read(struct seekwave_device *boot_data)
 		if (IS_ERR(filep)) {
 			error = PTR_ERR(filep);
 			skwboot_err("open file error, err = %d\n", error);
-			goto fail1;
+			goto fail;
 		}
 		skwboot_log("file bin path = %s\n", boot_data->dram_file_path);
 	}
@@ -484,20 +496,29 @@ static int skw_dram_img_read(struct seekwave_device *boot_data)
 	skwboot_log("file bin dram_dl_size = %d \n", boot_data->dram_dl_size);
 	boot_data->dram_img_data = (char *)kzalloc(boot_data->dram_dl_size, GFP_KERNEL);
 	if (boot_data->dram_img_data == NULL) {
-		goto fail;
+		goto fail1;
 	}
 	if (skw_read_file(filep, boot_data->dram_img_data,boot_data->dram_dl_size, &filep->f_pos) != boot_data->dram_dl_size) {
-		kfree(boot_data->dram_img_data);
-		boot_data->dram_img_data = NULL;
-		goto fail;
+		goto fail1;
 	}
+#if 0 //DEBUG
+	print_hex_dump(KERN_ERR, "img data ", 0, 16, 1,
+			boot_data->img_data, boot_data->img_size, 1);
+#endif
 	set_fs(old_fs);
 	filp_close(filep, NULL);
 	return 0;
 fail:
-	filp_close(filep, NULL);
-	skwboot_err("%s: analysis the done - '%s' \n",__func__, boot_data->dram_file_path);
+	if (!IS_ERR(filep) && filep != NULL) {
+		filp_close(filep, NULL);
+		skwboot_err("%s: analysis the done - '%s' \n",__func__, boot_data->dram_file_path);
+	}
+	set_fs(old_fs);
+	return -3;
 fail1:
+	if (!IS_ERR(filep)){
+		filp_close(filep, NULL);
+	}
 	set_fs(old_fs);
 	return -1;
 }
@@ -527,7 +548,7 @@ static int seekwave_boot_probe(struct  platform_device *pdev)
 	if (!io_bus &&(boot_data->chip_en >= 0)) {
 		skwboot_log("%s :CHIP_RESET AGAIN!\n", __func__);
 		gpio_set_value(boot_data->chip_en,0);
-		msleep(80);
+		msleep(20);
 		gpio_set_value(boot_data->chip_en, 1);
 		do {
 			msleep(10);
@@ -542,20 +563,16 @@ static int seekwave_boot_probe(struct  platform_device *pdev)
 		boot_data->iram_file_path = "SWT6652_IRAM_USB.bin";
 		boot_data->dram_file_path = "SWT6652_DRAM_USB.bin";
 	} else if (!strncmp(io_bus->bus->name, "pci", 3)) {
-		boot_data->pdev = pdev;
-		if (container_of(io_bus, struct pci_dev, dev)->device == 0x6316) {
-			boot_data->iram_file_path = "SWT6652_IRAM_PCIE.bin";
-			boot_data->dram_file_path = "SWT6652_DRAM_PCIE.bin";
-		} else if (container_of(io_bus, struct pci_dev, dev)->device == 0x6315) {
-			boot_data->iram_file_path = "SWT6652S_IRAM_PCIE.bin";
-			boot_data->dram_file_path = "SWT6652S_DRAM_PCIE.bin";
-		}
+		boot_data->iram_file_path = "SWT6652_IRAM_PCIE.bin";
+		boot_data->dram_file_path = "SWT6652_DRAM_PCIE.bin";
 	} else {
 		boot_data->iram_file_path = "SWT6652_IRAM_SDIO.bin";
 		boot_data->dram_file_path = "SWT6652_DRAM_SDIO.bin";
 	}
 	skw_boot_init(boot_data);
+#ifdef STR_MODE_REINITBUS
 	boot_data->pdev = pdev;
+#endif
 	ret = skw_first_boot(boot_data);
 	printk("%s bus-name=%s\n", __func__, io_bus->bus->name);
 	if (strncmp(io_bus->bus->name, "usb", 3))
@@ -590,6 +607,10 @@ static int seekwave_boot_remove(struct  platform_device *pdev)
 			kfree(boot_data->dl_bin);
 			boot_data->dl_bin = NULL;
 		}
+		if(boot_data->img_data){
+			kfree(boot_data->img_data);
+			boot_data->img_data = NULL;
+		}
 		boot_data->iram_file_path = NULL;
 		boot_data->dram_file_path = NULL;
 		devm_kfree(&pdev->dev, boot_data);
@@ -623,7 +644,6 @@ static struct platform_driver seekwave_driver ={
 	.shutdown = seekwave_boot_shutdown,
 };
 
-
 /***********************************************************************
  *Description:BT download boot pdata
  *Seekwave tech LTD
@@ -631,11 +651,47 @@ static struct platform_driver seekwave_driver ={
  *Date:2021-11-3
  *Modify:
  ***********************************************************************/
+static int get_sleep_status(int portno, char *buffer, int size)
+{
+	memcpy(buffer, "WAKE", 4);
+	if (boot_data->host_gpio >=0) {
+		if (gpio_get_value(boot_data->host_gpio) == 0)
+			memcpy(buffer, "DOWN", 4);
+	}
+	return 4;
+}
+static int set_sleep_status(int portno, char *buffer, int size)
+{
+	int i, count;
+
+	for(i=0; i<2; i++) {
+		if (gpio_get_value(boot_data->host_gpio))
+			return 1;
+		if(buffer && !strncmp(buffer, "WAKE", 4)) {
+			gpio_set_value(boot_data->chip_gpio, 0);
+			udelay(10);
+			gpio_set_value(boot_data->chip_gpio, 1);
+		}
+		count = 0;
+		do {
+			if (count++ < 100)
+				udelay(20);
+		} while(gpio_get_value(boot_data->host_gpio) ==0);
+		if (gpio_get_value(boot_data->host_gpio))
+			return 1;
+		udelay(100);
+	}
+	if (gpio_get_value(boot_data->host_gpio)==0)
+		skwboot_log("wakeup CHIP timeout!!! \n");
+	return 1;
+}
 struct sv6160_platform_data boot_pdata = {
 	.data_port = 8,
 	.bus_type = SDIO_LINK,
 	.max_buffer_size = 0x800,
 	.align_value = 4,
+	.hw_sdma_rx = get_sleep_status,
+	.hw_sdma_tx = set_sleep_status,
 	.open_port = bt_start_service,
 	.close_port = bt_stop_service,
 };
@@ -682,6 +738,37 @@ int skw_bind_boot_driver(struct device *dev)
 	btboot_pdev = pdev;
 	return ret;
 }
+#ifndef CONFIG_OF
+static void seekwave_release(struct device *dev)
+{
+}
+static struct platform_device seekwave_device ={
+	.name = "sv6160",
+	.dev = {
+		.release = seekwave_release,
+	}
+};
+#endif
+int seekwave_boot_init(void)
+{
+	btboot_pdev = NULL;
+#ifndef CONFIG_OF
+	platform_device_register(&seekwave_device);
+#endif
+	platform_driver_register(&seekwave_driver);
+	return skw_ucom_init();
+}
+
+void seekwave_boot_exit(void)
+{
+	skw_ucom_exit();
+#ifndef CONFIG_OF
+	platform_device_unregister(&seekwave_device);
+#endif
+	platform_driver_unregister(&seekwave_driver);
+
+}
+
 /****************************************************************
  *Description:the data Little Endian process interface
  *Func:EndianConv_32
@@ -781,17 +868,7 @@ static int skw_boot_init(struct seekwave_device *boot_data)
 #else
 	ret = skw_request_firmwares(boot_data, boot_data->dram_file_path,
 		       	boot_data->iram_file_path, boot_data->skw_nv_name);
-	if (ret == ENOENT) {
-		if (boot_data->iram_img_data != NULL) {
-			kfree(boot_data->iram_img_data);
-			boot_data->iram_img_data = NULL;
-			boot_data->iram_dl_size = 0;
-		}
-		if (boot_data->dram_img_data != NULL) {
-			kfree(boot_data->dram_img_data);
-			boot_data->dram_img_data = NULL;
-			boot_data->dram_dl_size = 0;
-		}
+	if (ret < 0) {
 		ret = skw_request_firmwares(boot_data, "RAM_RW_KERNEL_DRAM.bin",
 			       	"ROM_EXEC_KERNEL_IRAM.bin",boot_data->skw_nv_name);
 		if (ret < 0){
@@ -1067,41 +1144,6 @@ static int skw_first_boot(struct seekwave_device *boot_data)
 #endif
 	return ret;
 }
-#ifdef CONFIG_NO_DTS
-#undef CONFIG_OF
-#endif
-
-#ifndef CONFIG_OF
-static void seekwave_release(struct device *dev)
-{
-}
-static struct platform_device seekwave_device ={
-	.name = "sv6160",
-	.dev = {
-		.release = seekwave_release,
-	}
-};
-#endif
-int seekwave_boot_init(void)
-{
-	btboot_pdev = NULL;
-#ifndef CONFIG_OF
-	platform_device_register(&seekwave_device);
-#endif
-	platform_driver_register(&seekwave_driver);
-	return skw_ucom_init();
-}
-
-void seekwave_boot_exit(void)
-{
-	skw_ucom_exit();
-#ifndef CONFIG_OF
-	platform_device_unregister(&seekwave_device);
-#endif
-	platform_driver_unregister(&seekwave_driver);
-
-}
-
 
 //module_init(seekwave_boot_init);
 //module_exit(seekwave_boot_exit);

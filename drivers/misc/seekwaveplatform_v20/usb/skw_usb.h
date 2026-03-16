@@ -1,18 +1,3 @@
-/*****************************************************************
- *Copyright (C) 2021 Seekwave Tech Inc.
- *Filename : skw_usb.h
- *Authors:seekwave platform
- *
- * This software is licensed under the terms of the the GNU
- * General Public License version 2, as published by the Free
- * Software Foundation, and may be copied, distributed, and
- * modified under those terms.
- *
- * This program is distributed in the hope that it will be usefull,
- * but without any warranty;without even the implied warranty of
- * merchantability or fitness for a partcular purpose. See the
- * GUN General Public License for more details.
- * **************************************************************/
 #ifndef WCN_USB_H
 #define WCN_USB_H
 
@@ -49,6 +34,4 @@
 int skw_usb_recovery_debug(int disable);
 int skw_usb_recovery_debug_status(void);
 void reboot_to_change_bt_uart1(char *mode);
-int skw_usb_debug_log_open(void);
-int skw_usb_debug_log_close(void);
 #endif

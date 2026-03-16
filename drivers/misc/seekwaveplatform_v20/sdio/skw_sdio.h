@@ -159,19 +159,17 @@ struct skw_sdio_data_t {
 };
 
 struct debug_vars {
-	u16 cmd_timeout_cnt;
-	u32 rx_inband_irq_cnt;
-	u32 rx_gpio_irq_cnt;
-	u32 rx_read_cnt;
-	u32 rx_irq_statistics_cnt;
-	u32 last_sent_wifi_cmd[3];
-	u64 last_sent_time;
-	u64 last_rx_submit_time;
-	u64 host_assert_cp_time;
-	u64 cp_assert_time;
-	u64 last_irq_time;
-	u64 rx_irq_statistics_time;
-	u32 chn_irq_cnt[SDIO2_MAX_CH_NUM];
+       u16 cmd_timeout_cnt;
+       u32 rx_inband_irq_cnt;
+       u32 rx_gpio_irq_cnt;
+       u32 rx_read_cnt;
+       u32 last_sent_wifi_cmd[3];
+       u64 last_sent_time;
+       u64 last_rx_submit_time;
+       u64 host_assert_cp_time;
+       u64 cp_assert_time;
+       u64 last_irq_time;
+       u32 chn_irq_cnt[SDIO2_MAX_CH_NUM];
 #define CHN_IRQ_RECORD_NUM 3
 	u64 chn_last_irq_time[SDIO2_MAX_CH_NUM][CHN_IRQ_RECORD_NUM];
 	u64 last_irq_times[CHN_IRQ_RECORD_NUM];
@@ -257,8 +255,6 @@ int skw_sdio_wifi_status(void);
 int skw_sdio_gpio_irq_pre_ops(void);
 void skw_get_sdio_debug_info(char *buffer, int size);
 void skw_get_assert_print_info(char *buffer, int size);
-int skw_sdio_debug_log_open(void);
-int skw_sdio_debug_log_close(void);
 
 #define skwsdio_log(fmt, args...) \
 	pr_info("[SKWSDIO]:" fmt, ## args)

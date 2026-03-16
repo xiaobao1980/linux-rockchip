@@ -107,8 +107,8 @@ static int dloader_send_data(const char *command, int command_len, const char *a
 	/* send command */
 	ret = dloader_write((char *)command, command_len, &actual_len, 3000);
 	if (ret <0 || actual_len != command_len) {
-		skw_usb_err(" send cmd error ret %d actual_len %d command_len %d\n",
-				ret, actual_len, command_len);
+		printk("%s send cmd error ret %d actual_len %d command_len %d\n",
+				__func__, ret, actual_len, command_len);
 	} else {
 		if (ack == NULL)
 			goto OUT;
@@ -116,8 +116,7 @@ static int dloader_send_data(const char *command, int command_len, const char *a
 		/* read ack and check it */
 		ret = dloader_read(data, data_size, &actual_len, 3000);
 		if (ret <0 || ack_len > actual_len || compare_msg(ack, data, ack_len)) {
-			skw_usb_err(" ack is NACK:ret == %d\n", ret);
-			print_hex_dump(KERN_ERR, "ACK ERR:", 0, 16, 1, data, ack_len, 1);
+			printk("%s ack is NACK:ret-- %d\n", __func__, ret);
 			ret = -EIO;
 		}
 	}
@@ -147,21 +146,18 @@ static int dloader_send_command(const char *command,  int command_len, const cha
 	memcpy(data, (char*)command, command_len);
 	ret = dloader_write(data, command_len, &actual_len, 3000);
 	if (ret <0 || actual_len != command_len) {
-		skw_usb_err(" send cmd error ret %d actual_len %d command_len %d\n",
-				ret, actual_len, command_len);
+		printk("%s send cmd error ret %d actual_len %d command_len %d\n",
+				__func__, ret, actual_len, command_len);
 	} else {
 		/* read ack */
 		ret = dloader_read(data, data_size, &actual_len, 3000);
 		if (ret <0) {
-			skw_usb_warn(" ack is NACK: acklen ===%d- actual_len ==%d--ret == %d\n",
-				ret, ack_len, actual_len);
+			printk("%s ack is NACK: acklen ===%d- actual_len ==%d--ret == %d\n",
+				__func__, ret, ack_len, actual_len);
 		}
 	}
-	if ((command_len > 8) &&(0 == command[8])){
-		if(actual_len > sizeof(connect_ack))
-			actual_len = sizeof(connect_ack);
+	if(0 == command[8])
 		memcpy(connect_ack, data, actual_len);
-	}
 	kfree(data);
 	return ret;
 }
@@ -397,7 +393,7 @@ int dloader_dump_from_romcode_usb(unsigned int addr, void *buf, int len)
 
 	ret = dloader_send_command(command, command_len, NULL, 0);
 	if (ret < 0) {
-		skw_usb_err(" send command error\n");
+		printk("%s send command error\n", __func__);
 		return -EIO;
 	}
 
@@ -407,7 +403,7 @@ int dloader_dump_from_romcode_usb(unsigned int addr, void *buf, int len)
 			size = len;
 		ret = dloader_read(buf, size, &actual_len, 3000);
 		if (ret < 0)
-			skw_usb_err("dloader_read_ack dump memory error\n");
+			printk("dloader_read_ack dump memory error\n");
 		else len -= actual_len;
 	}
 	return ret;
@@ -449,20 +445,12 @@ static void dloader_work(struct work_struct *work)
 		firmware_data = usb_boot_data->dram_img_data;
 		ret = usb_download_image(port, usb_boot_data->dram_dl_addr, usb_boot_data->dram_dl_size);
 		if(ret <0)
-			skw_usb_warn(" dram download img fail !!!!\n");
+			skw_usb_info("%s dram download img fail !!!!\n", __func__);
 	}
 
-	if(!ret && usb_boot_data->iram_dl_size > 0){
+	if(usb_boot_data->iram_dl_size > 0){
 		firmware_data = usb_boot_data->iram_img_data;
-		ret = usb_download_image(port, usb_boot_data->iram_dl_addr, usb_boot_data->iram_dl_size);
+		usb_download_image(port, usb_boot_data->iram_dl_addr, usb_boot_data->iram_dl_size);
 	}
-	if (!ret)
-		ret = dloader_execute_image(port, START_ADDR);
-
-	if (ret < 0 && chip_en_gpio >= 0) {
-		modem_status = MODEM_DOWNLOAD_FAILED;
-		skw_usb_info("download failed! power off device\n");
-		gpio_set_value(chip_en_gpio, 0);
-		msleep(10);
-	}
+	dloader_execute_image(port, START_ADDR);
 }

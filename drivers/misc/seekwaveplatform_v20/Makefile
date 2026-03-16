@@ -6,7 +6,7 @@ PWD :=$(shell pwd)
 CURFOLDER ?=$(pwd)
 
 ifeq ($(CONFIG_SKW_PCIE),m)
-	ccflags-y +=-Idrivers/misc/seekwaveplatform_v20/pcie
+ccflags-y +=-Idrivers/misc/seekwaveplatform_v20/pcie
 endif
 
 #ifdef CONFIG_SEEKWAVE_BSP_DRIVERS_V20
@@ -17,14 +17,11 @@ endif
 #endif
 
 ifeq ($(CONFIG_SKW_BT),m)
-	ccflags-y += -DCONFIG_BT_SEEKWAVE
-	ccflags-y += -DCONFIG_NO_DTS
+        ccflags-y += -DCONFIG_BT_SEEKWAVE
 endif
-ifeq ($(CONFIG_NO_DTS),y)
-	ccflags-y += -DCONFIG_NO_DTS
-endif
+
 ifneq ($(skw_extra_flags),)
-	ccflags-y += $(skw_extra_flags) -DSKW_EXT_INC
+        ccflags-y += $(skw_extra_flags) -DSKW_EXT_INC
 endif
 
 ifeq ($(CONFIG_SEEKWAVE_PLD_RELEASE),m)

@@ -22,7 +22,11 @@
 #include "skw_usb.h"
 #include "skw_usb_log.h"
 #include "skw_usb_debugfs.h"
-#define MAX_BUFFER_SIZE 20*1024
+#ifdef CONFIG_SV6160_LITE_FPGA
+#define MAX_BUFFER_SIZE 12*1024
+#else
+#define MAX_BUFFER_SIZE 23*1024
+#endif
 #define MAX_MSG_SIZE	MAX_BUFFER_SIZE
 
 #define VENDOR_MSG_MODEM_ASSERT 0xA5
@@ -30,8 +34,6 @@
 #define VENDOR_MSG_PACKET_COUNT 0xA7
 #define VENDOR_MSG_LOG_SWITCH	0xA8
 #define VENDOR_MSG_MODEM_RESET  0xA9
-#define VENDOR_MSG_MODEM_SUSP   0xAA
-
 #define	WIFI_SERVICE	0
 #define BT_SERVICE	  1
 
@@ -41,7 +43,6 @@
 #define MODEM_OFF		0
 #define MODEM_ON		1
 #define MODEM_HALT		2
-#define MODEM_DOWNLOAD_FAILED   4
 
 #define WIFI_PORT_SHARE_FLAG	0x4000
 #define USB_HOST_RESUME_SUPPORT 0x20
@@ -50,8 +51,6 @@
 #define MAX_PACKET_COUNT 20
 static struct delayed_work skw_except_work;
 static struct work_struct add_device_work;
-static struct work_struct dump_memory_worker;
-static struct work_struct usb_control_worker;
 static struct platform_device *wifi_data_pdev;
 static u64 port_dmamask = DMA_BIT_MASK(32);
 static u32 service_state_map = 0;
@@ -66,6 +65,7 @@ static BLOCKING_NOTIFIER_HEAD(modem_notifier_list);
 static int chip_en_gpio;
 static int host_wake_gpio;
 static int modem_status;
+static int usb_speed_switching;
 static int cls_recovery_mode_en;
 static char *skw_chipid;
 static u32 last_sent_wifi_cmd[3];
@@ -75,7 +75,6 @@ static u64 last_sent_time, last_ack_time;
 static struct scatterlist *sgs;
 static int nr_sgs;
 static int start_service_flag = 0;
-
 /************************************************************************
  *Decription:
  *Author:jiayong.yang
@@ -89,7 +88,7 @@ static const struct usb_device_id skw_usb_io_id_table[] = {
 	{ USB_DEVICE(0x0483, 0x5720) },
 	{ USB_DEVICE(0x0483, 0x5721) },
 	{ USB_DEVICE(0x3607, 0x6316) },
-	{ USB_DEVICE(0x3607, 0x6621) },
+	{ USB_DEVICE(0x3607, 0x6160) },
 	{}	/* Terminating entry */
 };
 /************************************************************************
@@ -110,7 +109,7 @@ static struct recovery_data{
 
 #define SKW_USB_GET_RECOVERY_DATA() &g_recovery_data
 
-static struct usb_port_struct {
+struct usb_port_struct {
 	struct work_struct work;
 	struct platform_device *pdev;
 	int	portno;
@@ -150,8 +149,9 @@ static struct usb_port_struct {
 	int	tx_urb_count;
 	int	rx_packet_count;
 	int     suspend;
-	u64 	tx_done_time;
-	u64 	rx_done_time;
+	u64     rx_complete_time;
+	u64     parser_time[4];
+	u64     tx_time[2];
 } *usb_ports[MAX_USB_PORT];
 
 static int modem_assert(void);
@@ -170,17 +170,11 @@ static	struct wakeup_source *usb_wakelock;
 #endif
 static int    wakelocked;
 static int usb_bt_rx_entry(void *para);
-char firmware_version[256];
-static int	bt_audio_port;
-static struct platform_device *bluetooth_pdev;
+char firmware_version[128];
+int	bt_audio_port;
+struct platform_device *bluetooth_pdev;
 static int wifi_port_share;
 static int bulk_async_read;
-static int dump_memory_done;
-static char* dump_memory_buffer=NULL;
-static int dump_buffer_size=0;
-static int* dump_log_size=NULL;
-static int usb_bus_num;
-static int usb_port_num;
 
 void skw_get_port_statistic(char *buffer, int size)
 {
@@ -190,17 +184,15 @@ void skw_get_port_statistic(char *buffer, int size)
 	if(!buffer)
 		return;
 
-	ret += sprintf(&buffer[ret], "%s", firmware_version);
-	for(i=0; i<MAX_USB_PORT; i++) {
+	for(i=0; i<2; i++) {
 		if(ret >= size)
 			break;
 
-		if (usb_ports[i])
 		ret += sprintf(&buffer[ret],
-			"port%d: req_tx %d tx_done %d, rx %d: tx_time: 0x%x rx_time: 0x%x\n",
-			i, usb_ports[i]->req_tx_packet,	usb_ports[i]->sent_packet_count,
-		       	usb_ports[i]->rx_packet_count, (u32)usb_ports[i]->tx_done_time,
-			(u32)usb_ports[i]->rx_done_time);
+			"port%d: req_tx %d tx_done %d, rx %d\n",
+			i, usb_ports[i]->req_tx_packet,
+			usb_ports[i]->sent_packet_count,
+			usb_ports[i]->rx_packet_count);
 	}
 }
 
@@ -316,7 +308,7 @@ static void usb_setup_service_devices(void)
 		bluetooth_pdev = NULL;
 		ret = platform_device_add(bt_port->pdev);
 		if(ret) {
-			skw_usb_err("failt to register Bluetooth device\n");
+			dev_err(&bt_port->udev->dev, "failt to register Bluetooth device\n");
 			platform_device_put(bt_port->pdev);
 			bt_port->pdev = NULL;
 		} else
@@ -326,8 +318,7 @@ static void usb_setup_service_devices(void)
 }
 void add_devices_work(struct work_struct *work)
 {
-	if (usb_ports[0])
-		usb_setup_service_devices();
+	usb_setup_service_devices();
 }
 void skw_set_bt_suspend_flag(void)
 {
@@ -356,7 +347,7 @@ static void usb_port_alloc_recv_urbs(struct usb_port_struct *port, struct usb_en
 			urb->transfer_buffer, buffer_size, bulkin_async_complete, NULL);
 		list_add_tail(&urb->urb_list, &port->rx_urb_list);
 	}
-	skw_usb_dbg(" urb cout %d\n", i);
+	skw_usb_dbg("%s urb cout %d\n", __func__, i);
 }
 
 static void usb_port_alloc_xmit_urbs(struct usb_port_struct *port, struct usb_endpoint_descriptor *epd, int count, int buffer_size)
@@ -383,7 +374,7 @@ static void usb_port_alloc_xmit_urbs(struct usb_port_struct *port, struct usb_en
 			urb->transfer_buffer, buffer_size, bulkout_async_complete, NULL);
 		list_add_tail(&urb->urb_list, &port->tx_urb_list);
 	}
-	skw_usb_dbg(" urb cout %d\n", i);
+	skw_usb_dbg("%s urb cout %d\n", __func__, i);
 }
 
 /************************************************************************
@@ -397,34 +388,24 @@ int open_usb_port(int id, void *callback, void *data)
 {
 	struct usb_port_struct *port;
 
-	if (id >= MAX_USB_PORT)
+	if(id >= MAX_USB_PORT)
 		return -EINVAL;
 
 	port = usb_ports[id];
-	if (port->state==0)
+	if(port->state==0)
 		return -EIO;
-	skw_usb_info("port%d\n", id);
 	if (port->state==1) {
-		if(port->read_urb && !port->read_urb->context)
-			init_usb_anchor(&port->read_submitted);
-		if(port->write_urb && !port->write_urb->context)
-			init_usb_anchor(&port->write_submitted);
+		init_usb_anchor(&port->read_submitted);
+		init_usb_anchor(&port->write_submitted);
 	}
 	port->state = 2;
 	port->rx_submit = callback;
 	port->rx_data = data;
-	if (callback && data && !port->thread) {
+	if(callback && data && !port->thread) {
 		sema_init(&port->sem, 0);
 		port->thread = kthread_create(usb_bt_rx_entry, port, port->interface->cur_altsetting->string);
 		if(port->thread)
 			wake_up_process(port->thread);
-	}
-	if (port->interface && modem_status==MODEM_ON) {
-		struct usb_host_interface *iface_desc;
-		iface_desc = port->interface->cur_altsetting;
-		if (iface_desc && iface_desc->string &&
-		    !strncmp(iface_desc->string, "LOG", 3))
-			skw_usb_cp_log(0);
 	}
 	return 0;
 }
@@ -471,7 +452,7 @@ static int  bulkin_read(struct usb_port_struct *port, void *buffer, int size)
 		if(assert_info_print && assert_info_print<28 && retval<100) {
 			assert_info_print++;
 			if(retval > 4)
-				skw_usb_info("%s", (char *)buffer);
+				printk("%s", (char *)buffer);
 		}
 		if(retval == 4)
 			assert_info_print = 28;
@@ -480,7 +461,7 @@ static int  bulkin_read(struct usb_port_struct *port, void *buffer, int size)
 }
 int skw_bus_version(void)
 {
-	skw_usb_info("USB bus Version1.0\n");
+	printk("USB bus Version1.0\n");
 	return 0;
 }
 int bulkin_read_async(struct usb_port_struct *port)
@@ -492,6 +473,7 @@ int bulkin_read_async(struct usb_port_struct *port)
 	spin_lock_irqsave(&port->rx_urb_lock, flags);
 	urb = list_first_entry(&port->rx_urb_list, struct urb, urb_list);
 	list_del_init(&urb->urb_list);
+	bulk_async_read++;
 	spin_unlock_irqrestore(&port->rx_urb_lock, flags);
 	if(urb->context) {
 		skw_usb_info("port is busy!!!\n");
@@ -504,15 +486,15 @@ int bulkin_read_async(struct usb_port_struct *port)
 		list_add_tail(&urb->urb_list, &port->suspend_urb_list);
 	else {
 		usb_anchor_urb(urb, &port->read_submitted);
-		bulk_async_read++;
 		retval = usb_submit_urb(urb, GFP_ATOMIC);
 		if (retval < 0) {
-			bulk_async_read--;
 			usb_unanchor_urb(urb);
-			urb->context = NULL;
-			skw_usb_info(" is error!!! %d\n", retval);
+			dev_info(&port->pdev->dev, "%s is error!!! %d\n", __func__, retval);
 			list_add_tail(&urb->urb_list, &port->suspend_urb_list);
-		}
+		} else if (jiffies - port->rx_complete_time > 100)
+			dev_info(&port->pdev->dev, "%s warnings time:%llu-%llu-%llu-%llu-%llu-%llu\n", __func__,
+				(u64)jiffies, port->parser_time[3], port->parser_time[2], port->parser_time[1],
+				port->parser_time[0], port->rx_complete_time);
 	}
 	return retval;
 }
@@ -528,17 +510,16 @@ static int bulkout_write(struct usb_port_struct *port, void *buffer, int size)
 	int retval = -1;
 	DECLARE_COMPLETION_ONSTACK(done);
 
-
-	if (port && port->write_urb && !port->write_urb->context) {
-		if (port->suspend) {
+	if (port->suspend) {
 		skw_usb_info("port%d is suspended\n", port->portno);
-			return -EOPNOTSUPP;
-		}
-		port->write_urb->context = &done;
+		return -EOPNOTSUPP;
+	}
+	if (port && port->write_urb && !port->write_urb->context) {
 		port->write_urb->transfer_buffer = buffer;
 		port->write_urb->transfer_buffer_length = size;
 		if(size%port->ep_mps == 0)
 			port->write_urb->transfer_flags |= URB_ZERO_PACKET;
+		port->write_urb->context = &done;
 		usb_anchor_urb(port->write_urb, &port->write_submitted);
 		retval = usb_submit_urb(port->write_urb,GFP_KERNEL);
 		if(retval==0) {
@@ -578,8 +559,6 @@ int bulkout_write_async(struct usb_port_struct *port, void *buffer, int size)
 		retval = wait_event_interruptible(port->tx_wait, (!list_empty(&port->tx_urb_list)));
 		spin_lock_irqsave(&port->tx_urb_lock, flags);
 	}
-	if (port->state == 0)
-		return -EIO;
 	urb = list_first_entry(&port->tx_urb_list, struct urb, urb_list);
 	list_del_init(&urb->urb_list);
 	port->tx_urb_count++;
@@ -594,13 +573,10 @@ int bulkout_write_async(struct usb_port_struct *port, void *buffer, int size)
 	retval = usb_submit_urb(urb,GFP_KERNEL);
 	if (retval < 0) {
 		usb_unanchor_urb(urb);
-		spin_lock_irqsave(&port->tx_urb_lock, flags);
-		list_add_tail(&urb->urb_list, &port->tx_urb_list);
 		port->tx_urb_count--;
-		spin_unlock_irqrestore(&port->tx_urb_lock, flags);
 		skw_usb_info("is error!!! %d\n",retval);
 	}
-	skw_usb_dbg(" portno %d wait done %d %d\n", port->portno, retval, port->tx_urb_count);
+	dev_dbg(&port->udev->dev,"%s %d wait done %d %d\n",__func__, port->portno, retval, port->tx_urb_count);
 	return retval;
 }
 void check_sgs_headers(struct scatterlist *sgs, int sg_num, int total)
@@ -630,8 +606,6 @@ int bulkout_write_sg_async(struct usb_port_struct *port, struct scatterlist *sgs
 		retval = wait_event_interruptible(port->tx_wait, (!list_empty(&port->tx_urb_list)));
 		spin_lock_irqsave(&port->tx_urb_lock, flags);
 	}
-	if (port->state==0)
-		return -EIO;
 	urb = list_first_entry(&port->tx_urb_list, struct urb, urb_list);
 	port->tx_urb_count++;
 	list_del_init(&urb->urb_list);
@@ -647,14 +621,11 @@ int bulkout_write_sg_async(struct usb_port_struct *port, struct scatterlist *sgs
 	if(total%port->ep_mps == 0)
 		urb->transfer_flags |= URB_ZERO_PACKET;
 	usb_anchor_urb(urb, &port->write_submitted);
-	//skw_usb_info("portno %d submit  %d\n", port->portno, port->tx_urb_count);
+	//dev_info(&port->udev->dev,"%s %d submit  %d\n",__func__, port->portno,  port->tx_urb_count);
 	retval = usb_submit_urb(urb,GFP_KERNEL);
 	if (retval < 0) {
-		usb_unanchor_urb(urb);
-		spin_lock_irqsave(&port->tx_urb_lock, flags);
-		list_add_tail(&urb->urb_list, &port->tx_urb_list);
 		port->tx_urb_count--;
-		spin_unlock_irqrestore(&port->tx_urb_lock, flags);
+		usb_unanchor_urb(urb);
 	}
 	return retval;
 
@@ -761,7 +732,6 @@ int close_usb_port(int portno)
 
 	port = usb_ports[portno];
 
-	skw_usb_info("port%d\n", portno);
 	if (port) {
 		port->state = 1;
 		if(port->write_urb && port->write_urb->context)
@@ -771,13 +741,6 @@ int close_usb_port(int portno)
 		if(port->thread && down_interruptible(&port->sem))
 			skw_usb_info("port%d rx thread exit\n", portno);
 		port->thread = NULL;
-		if (port->interface) {
-			struct usb_host_interface *iface_desc;
-			iface_desc = port->interface->cur_altsetting;
-			if (iface_desc && iface_desc->string &&
-			    !strncmp(iface_desc->string, "LOG", 3))
-				skw_usb_cp_log(1);
-		}
 	}
 	return 0;
 }
@@ -807,12 +770,11 @@ int wifi_send_cmd(int portno, struct scatterlist *sg, int sg_num, int total)
 		skw_usb_info("port%d is suspended\n", portno);
 		return -EOPNOTSUPP;
 	}
-	if (portno == 0) {
-		data = (u32 *)sg_virt(sg);
-		memcpy(last_sent_wifi_cmd, data, 12);
-		last_sent_wifi_cmd[0] =  bulk_async_read;
-	}
+	data = (u32 *)sg_virt(sg);
+	memcpy(last_sent_wifi_cmd, data, 12);
+	port->tx_time[0] = jiffies;
 	ret = bulkout_write_sg(port, sg, sg_num, total);
+	port->tx_time[1] = jiffies;
 	return ret;
 }
 /************************************************************************
@@ -825,7 +787,6 @@ int wifi_send_cmd(int portno, struct scatterlist *sg, int sg_num, int total)
 int wifi_send_cmd_async(int portno, struct scatterlist *sg, int sg_num, int total)
 {
 	struct usb_port_struct *port;
-	u32 *data;
 
 	if(total==0)
 		return 0;
@@ -841,11 +802,6 @@ int wifi_send_cmd_async(int portno, struct scatterlist *sg, int sg_num, int tota
 		skw_usb_info("port%d is suspended\n", portno);
 		return -EOPNOTSUPP;
 	}
-	if (portno == 0) {
-		data = (u32 *)sg_virt(sg);
-		memcpy(last_sent_wifi_cmd, data, 12);
-		last_sent_wifi_cmd[0] =  bulk_async_read;
-	}
 	return bulkout_write_sg_async(port, sg, sg_num, total);
 }
 
@@ -856,7 +812,7 @@ int wifi_send_cmd_async(int portno, struct scatterlist *sg, int sg_num, int tota
  *Modfiy:
  *Notes: this function must not be invoked in IRQ context.
  ************************************************************************/
-static int modem_assert_work(void)
+static int modem_assert(void)
 {
 	struct usb_port_struct *port;
 	struct recovery_data *recovery = SKW_USB_GET_RECOVERY_DATA();
@@ -873,9 +829,8 @@ static int modem_assert_work(void)
 		ret = usb_control_msg(port->udev, usb_sndctrlpipe(port->udev, 0),
 				VENDOR_MSG_MODEM_ASSERT, USB_DIR_OUT| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
 				0,0,NULL,0,1000);
-		skw_usb_err("SND ASSERT CMD ret = %d cmd: 0x%x 0x%x 0x%x: ACK 0x%x-0x%x-0x%x EVT: 0x%x 0x%x 0x%x \n",
-				ret, cmd[0], cmd[1], cmd[2], last_recv_wifi_ack[0],last_recv_wifi_ack[1],
-				last_recv_wifi_ack[2], last_recv_wifi_evt[0],last_recv_wifi_evt[1],last_recv_wifi_evt[2]);
+		skw_usb_err("SND ASSERT CMD ret = %d cmd: 0x%x 0x%x 0x%x:%llu-%llu:%llu \n",
+				ret, cmd[0], cmd[1], cmd[2], port->tx_time[0],port->tx_time[1],last_ack_time);
 		modem_status = MODEM_HALT;
 #ifdef CONFIG_SEEKWAVE_PLD_RELEASE
 		schedule_delayed_work(&skw_except_work , msecs_to_jiffies(2000));
@@ -885,19 +840,7 @@ static int modem_assert_work(void)
 	}
 	return ret;
 }
-static void usb_control_work(struct work_struct *work)
-{
-	modem_assert_work();
-}
-static int modem_assert(void)
-{
-	struct usb_port_struct *port;
 
-	port = usb_ports[0];
-	if (port)
-		schedule_work(&usb_control_worker);
-	return 0;
-}
 int wifi_service_start(void)
 {
 	int ret = 0;
@@ -943,10 +886,6 @@ static int send_modem_service_command(u16 service, u16 command)
 	int ret = -1;
 	int timeout = 1000;
 	port = usb_ports[1];
-	if(usb_boot_data->chip_en < 0){
-		skw_usb_err("chip_en = %d Invalid Pls check HW !!\n", usb_boot_data->chip_en);
-		return ret;
-	}
 	if(port)
 		skw_usb_info("(%d,%d) state= %d\n", service, command, port->state);
 	if(port && port->state) {
@@ -955,7 +894,7 @@ static int send_modem_service_command(u16 service, u16 command)
 				VENDOR_MSG_SERVICE_CTRL, USB_DIR_OUT| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
 				service, command, NULL, 0, 1000);
 	}
-	if((command & 0x01) == SERVICE_START) {
+	if((command & 0xff) == SERVICE_START) {
 		skw_usb_info("ret = %d\n", ret);
 		complete(&loop_completion);
 		start_service_flag = 1;
@@ -994,19 +933,25 @@ static int skw_get_packet_count(u8 portno)
 	return ret;
 }
 
+
 void skw_usb_cp_log(int disable)
 {
 	struct usb_port_struct *port;
 	int ret = -1;
+
 	port = usb_ports[0];
 	if(port && port->state) {
 		ret = usb_control_msg(port->udev, usb_rcvctrlpipe(port->udev, 0),
 				VENDOR_MSG_LOG_SWITCH, USB_DIR_IN| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
 				disable, 0, NULL, 0, 1000);
-
-		skw_usb_info("(disable=%d) ret = %d\n", disable, ret);
+		if(ret==0)
+			cp_log_status = disable;
+		skw_usb_info("%s (disable=%d) ret = %d\n", __func__, disable, ret);
 	}
-	cp_log_status = disable;
+}
+int skw_usb_cp_log_status(void)
+{
+	return cp_log_status;
 }
 /************************************************************************
  *Decription:send BT start command to modem.
@@ -1023,7 +968,9 @@ static int skw_BT_service_start(void)
 	skw_usb_info("Enter modem_status=%d\n", modem_status);
 	if (service_state_map & (1<<BT_SERVICE))
 		return 0;
-
+#ifdef CONFIG_SEEKWAVE_PLD_RELEASE
+	skw_usb_cp_log(1);
+#endif
 	return send_modem_service_command(BT_SERVICE, SERVICE_START);
 }
 
@@ -1066,8 +1013,11 @@ static int skw_WIFI_service_start(void)
 	if (service_state_map & (1<<WIFI_SERVICE))
 		return 0;
 	cmd |= WIFI_PORT_SHARE_FLAG;
-#ifndef REINIT_USB_STR
-	cmd |= USB_HOST_RESUME_SUPPORT;
+	if (usb_boot_data->pdev == NULL)
+		cmd |= USB_HOST_RESUME_SUPPORT;
+
+#ifdef CONFIG_SEEKWAVE_PLD_RELEASE
+	skw_usb_cp_log(1);
 #endif
 	return send_modem_service_command(WIFI_SERVICE, cmd);
 }
@@ -1081,20 +1031,9 @@ static int skw_WIFI_service_start(void)
  ********************************************************************* */
 static int skw_WIFI_service_stop(void)
 {
-	int count=10;
-	int portno;
-	struct usb_port_struct *port;
-
+	int count=70;
 	skw_usb_info("Enter,STOPWIFI--- modem status %d, 0x%x\n",
 			modem_status, service_state_map);
-	for (portno=0; portno<2; portno++) {
-		port = usb_ports[portno];
-		if (port && port->write_urb && port->write_urb->context) {
-			usb_kill_anchored_urbs(&port->write_submitted);
-		} else if (port && port->tx_urb_count) {
-			usb_kill_anchored_urbs(&port->write_submitted);
-		}
-	}
 	if (modem_status == MODEM_HALT) {
 		service_state_map &= ~(1<<WIFI_SERVICE);
 		while(!usb_ports[1] && count--)
@@ -1115,15 +1054,9 @@ static int skw_WIFI_service_stop(void)
 static void bulkin_complete(struct urb *urb)
 {
 	struct usb_port_struct *port;
-	int portno;
+	int portno = usb_pipeendpoint(urb->pipe) - 1;
 
-	if(!urb)
-		return;
-
-	portno = usb_pipeendpoint(urb->pipe) - 1;
 	port = usb_ports[portno];
-	port->rx_done_time = jiffies;
-	port->rx_packet_count++;
 	if(urb) {
 		if(urb->status) {
 			skw_usb_info("endpoint%d actual = %d status %d\n",
@@ -1137,15 +1070,9 @@ static void bulkin_complete(struct urb *urb)
 }
 static void bulkin_async_complete(struct urb *urb)
 {
-	struct usb_port_struct *port;
+	struct usb_port_struct *port = urb->context;
 
-	if(!urb)
-		return;
-	port = urb->context;
-	if(!port)
-		return;
-	port->rx_done_time = jiffies;
-	bulk_async_read--;
+	port->rx_complete_time = jiffies;
 	if(urb->status) {
 		skw_usb_info("endpoint%d actual = %d status %d\n",
 			usb_pipeendpoint(urb->pipe), urb->actual_length, urb->status);
@@ -1160,8 +1087,9 @@ static void bulkin_async_complete(struct urb *urb)
 		else
 			list_add_tail(&urb->urb_list, &port->rx_urb_list);
 		spin_unlock(&port->rx_urb_lock);
+		bulk_async_read--;
 		if (port->state)
-			tasklet_hi_schedule(&port->tasklet);
+		tasklet_hi_schedule(&port->tasklet);
 	}
 }
 /************************************************************************
@@ -1173,20 +1101,10 @@ static void bulkin_async_complete(struct urb *urb)
  ********************************************************************* */
 static void bulkout_complete(struct urb *urb)
 {
-	struct usb_port_struct *port;
-	int portno;
-
-	portno = usb_pipeendpoint(urb->pipe) - 1;
-	port = usb_ports[portno];
-
 	if(urb->status)
 		skw_usb_info("endpoint%d actual = %d status %d\n",
 			usb_pipeendpoint(urb->pipe),  urb->actual_length, urb->status);
 
-	if (port) {
-		port->tx_done_time = jiffies;
-		port->sent_packet_count++;
-	}
 	if (urb->context)
 		complete(urb->context);
 }
@@ -1197,7 +1115,6 @@ static void bulkout_async_complete(struct urb *urb)
 	//unsigned long flags;
 
 	if(urb->status) {
-		port->sent_packet_count += urb->num_sgs;          
 		if(urb->sg && port->adma_tx_callback)
 			port->adma_tx_callback(port->portno, urb->sg, urb->num_sgs, port->tx_data, urb->status);
 		else if(urb->transfer_buffer && port->sdma_tx_callback)
@@ -1210,12 +1127,11 @@ static void bulkout_async_complete(struct urb *urb)
 	} else if(urb->transfer_buffer && port->sdma_tx_callback)
 		port->sdma_tx_callback(port->portno, urb->transfer_buffer, urb->transfer_buffer_length, port->tx_data, 0);
 	urb->context = NULL;
-	port->tx_done_time = jiffies;
 	spin_lock(&port->tx_urb_lock);
 	list_add_tail(&urb->urb_list, &port->tx_urb_list);
 	port->tx_urb_count--;
 	if(port->tx_urb_count==0 && port->sent_packet_count!=port->req_tx_packet)
-		skw_usb_info(" port[%d]= %d %d\n", port->portno, port->sent_packet_count, port->req_tx_packet);
+		skw_usb_info("%s port[%d]= %d %d\n", __func__, port->portno, port->sent_packet_count, port->req_tx_packet);
 	spin_unlock(&port->tx_urb_lock);
 	wake_up_interruptible(&port->tx_wait);
 }
@@ -1287,18 +1203,6 @@ int bulkout_write_timeout(int portno, char *buffer, int size, int *actual, int t
 		return *actual;
 	return ret;
 }
-static void kick_rx_thread(void)
-{
-	struct usb_port_struct *port;
-
-	skw_usb_info("submitted urb %d\n", bulk_async_read);
-	port = usb_ports[1];
-	if ((bulk_async_read == 0) && port &&
-		(!list_empty(&port->rx_urb_list)))
-		bulkin_read_async(port);
-	else if (port && list_empty(&port->rx_urb_list))
-		skw_usb_info("urb list is empty \n");
-}
 /************************************************************************
  *Decription:
  *Author:jiayong.yang
@@ -1307,6 +1211,7 @@ static void kick_rx_thread(void)
  *
  ********************************************************************* */
 static int register_rx_callback(int id, void *func, void *para);
+static int skw_usb_dump_read(unsigned int address, void *buf, unsigned int len);
 static int register_tx_callback(int id, void *func, void *para);
 static struct sv6160_platform_data wifi_pdata = {
 	.data_port = 0,
@@ -1338,7 +1243,7 @@ static struct sv6160_platform_data wifi_pdata = {
 		.write_tm = bulkout_write_timeout,
 	},
 	.tx_callback_register = register_tx_callback,
-	.rx_thread_wakeup = kick_rx_thread,
+	.usb_speed_switch = reboot_to_change_USB_speed_mode,
 };
 
 void usb_handle(unsigned long tsk_data)
@@ -1353,6 +1258,7 @@ void usb_handle(unsigned long tsk_data)
 	struct scatterlist *sg;
 	struct urb *urb;
 
+	port->parser_time[0] = jiffies;
 	if (!strncmp(skw_chipid, "SV6316", 6) || !strlen(skw_chipid)
             || !strncmp(skw_chipid, "SV6160LITE", 10))
 		data_flag = 2;
@@ -1372,10 +1278,10 @@ void usb_handle(unsigned long tsk_data)
 		buffer = urb->transfer_buffer;
 		transfer_count++;
 		if(urb->status < 0 || !port->state) {
-			skw_usb_err(" bulkin read status=%d state=%d\n", urb->status, port->state);
+			dev_err(&port->udev->dev, "%s bulkin read status=%d state=%d\n", __func__, urb->status, port->state);
 			return ;
 		}
-		if (port->rx_submit){
+		if(port->rx_submit) {
 			int is_cmd;
 			u32 d32;
 
@@ -1385,6 +1291,7 @@ void usb_handle(unsigned long tsk_data)
 			sg_count = 0;
 			sg = sgs;
 			is_cmd = 0;
+			port->parser_time[1] = jiffies;
 			while (offset+12 < read) {
 				sg_count++;
 				if(sg_count > nr_sgs) {
@@ -1405,12 +1312,8 @@ void usb_handle(unsigned long tsk_data)
 				if (size + offset > read || size > 2048 || size <= 12) {
 					skw_usb_warn("Invalid packet size=%d: %d : %d :%d  0x%x:0x%x!!!\n",
 							size, offset, read, sg_count, d32, data[2]);
-					if (cls_recovery_mode_en) {
-					//	gpio_set_value(chip_en_gpio, 0);
-						print_hex_dump(KERN_ERR, "PACKET1::", 0, 16, 1,
-								urb->transfer_buffer, offset+12, 1);
-						modem_assert();
-					}
+					print_hex_dump(KERN_ERR, "PACKET1::", 0, 16, 1,
+							urb->transfer_buffer, offset+12, 1);
 					if (sg_count > 0)
 						sg_count--;
 					break;
@@ -1419,30 +1322,30 @@ void usb_handle(unsigned long tsk_data)
 				sg++;
 				offset  += size;
 				if (is_cmd) {
-					if (modem_status != MODEM_ON)
-						skw_usb_info("rx_submit(0x%x): command: 0x%x 0x%x: 0x%x 0x%x readlen=%d\n", (u32)jiffies,
-							       	data[2], data[3], last_recv_wifi_ack[1], last_recv_wifi_ack[2], read);
-					if ((data[3] & 0xff) == 0x10) {
-						last_ack_time = jiffies;
-						memcpy(last_recv_wifi_ack, &data[1], 12);
-					} else
-						memcpy(last_recv_wifi_evt, &data[1], 12);
+					dev_dbg(&port->udev->dev, "rx_submit(%d): command: 0x%x 0x%x 0x%x 0x%x readlen=%d\n",
+							transfer_count, data[0], data[1], data[2], data[3], read);
+					if ((data[2] & 0xff) == 0x10)
+						memcpy(last_recv_wifi_ack, &data[2], 12);
+					else
+						memcpy(last_recv_wifi_evt, &data[2], 12);
 				}
 				data = (int *)&buffer[offset];
 			}
+			port->parser_time[2] = jiffies;
 			if(sg_count >15)
-				skw_usb_info("rx_submit: port%d packet count %d\n",
+				dev_info(&port->udev->dev, "rx_submit: port%d packet count %d\n",
 					port->portno, sg_count);
 			if(is_cmd)
 				port = usb_ports[wifi_pdata.cmd_port];
 			else
 				port = usb_ports[wifi_pdata.data_port];
-			if (port->rx_submit)
-				port->rx_submit(port->portno, sgs, sg_count, port->rx_data);
+			port->rx_submit(port->portno, sgs, sg_count, port->rx_data);
+			port->parser_time[3] = jiffies;
 			port->rx_packet_count += sg_count;
 			if (modem_status != MODEM_ON)
 				return ;
 			port = usb_ports[wifi_pdata.data_port];
+			last_ack_time = jiffies;
 		}
 	}
 
@@ -1493,19 +1396,17 @@ int usb_port_async_entry(void *para)
 	if (!sgs)
 		return -ENOMEM;
 	bulk_async_read = 0;
-	if (port->max_packet_count<=13)
-		usb_port_alloc_recv_urbs(port, port->epin, MAX_RX_URB_COUNT, 20*1024);
-	else
-		usb_port_alloc_recv_urbs(port, port->epin, MAX_TX_URB_COUNT, 24*1024);
+	usb_port_alloc_recv_urbs(port, port->epin, 3, 32*1024);
 	usb_port_alloc_xmit_urbs(port, port->epout,10,0);
 	msleep(300);
-	skw_usb_info(" port %d running packet %d %s 0x%x...\n",port->portno, mpc, skw_chipid, data_flag);
-	if (!list_empty(&port->rx_urb_list)) {
+	skw_usb_info("%s %d running packet %d %s 0x%x...\n", __func__, port->portno, mpc, skw_chipid, data_flag);
+	while(!list_empty(&port->rx_urb_list)) {
 		ret = bulkin_read_async(port);
+		break;
 	}
 
 	wait_event_interruptible(port->rx_wait, (!port->state));
-	skw_usb_info(" port %d stoped\n", port->portno);
+	dev_info(&port->udev->dev, "%s-port%d is stopped\n", __func__, port->portno);
 	msleep(50);
 	kfree(sgs);
 
@@ -1537,6 +1438,123 @@ int usb_port_async_entry(void *para)
 	return 0;
 }
 
+int usb_port_entry(void *para)
+{
+	struct usb_port_struct *port = para;
+	struct scatterlist *sgs, *sg;
+	struct sched_param param;
+	int	size, read, buf_size;
+	u16	mpc;
+	char *buffer;
+	int  transfer_count = 0;
+	u16  data_flag = 0x8000;
+
+	if(port->portno == 0) {
+		param.sched_priority = USB_RX_TASK_PRIO;
+#if KERNEL_VERSION(5, 9, 0) <= LINUX_VERSION_CODE
+		sched_set_fifo_low(current);
+#else
+		sched_setscheduler(current, SCHED_FIFO, &param);
+#endif
+	}
+
+	if(port->max_packet_count)
+		mpc = port->max_packet_count;
+	else
+		mpc = 2;
+
+	if (port->udev->descriptor.idProduct == 0x6316)
+		data_flag = 2;
+	sgs = kzalloc((mpc+1)*sizeof(struct scatterlist), GFP_KERNEL);
+	if (!sgs)
+		return -ENOMEM;
+	buf_size = 1568 * mpc;
+	buffer = kzalloc(buf_size, GFP_KERNEL);
+	if (!buffer)
+		return -ENOMEM;
+	skw_usb_info("the en_mps= %d------%s%d (MPC %d buffer_size 0x%x )is runninng\n",
+			port->ep_mps,__func__, port->portno, mpc, buf_size);
+	while(port->state){
+		int  *data, sg_count, offset;
+
+		sg_init_table(sgs, mpc+1);
+		read = 0;
+read_msg:
+		do{
+			if(port->state==0)
+				break;
+			read = bulkin_read(port, buffer, buf_size);
+
+		}while(!read);
+
+		if(read < 0 || !port->state) {
+			dev_err(&port->udev->dev, "bulkin read_len=%d state = %d\n", read, port->state);
+			break;
+		}
+		if (modem_status != MODEM_ON)
+			break;
+		transfer_count++;
+		if(port->rx_submit) {
+			int is_cmd;
+			data = (int *)buffer;
+			offset = 0;
+			sg_count = 0;
+			sg = sgs;
+			is_cmd = 0;
+			while(offset < read) {
+				sg_count++;
+				if(sg_count > mpc) {
+					skw_usb_warn("packet count is overflow %d : %d : %d : %d!!!\n",
+							offset, read, sg_count, mpc);
+					sg_count--;
+					break;
+				}
+				size = data[2] >> 16;
+				size += 3;
+				size = size & 0xfffffffc;
+				if(size + offset > read)
+					size = read  - offset;
+				dev_dbg(&port->udev->dev,"submit len=%d size =%d msg: 0x%x 0x%x 0x%x \n",
+					 read, size, data[0], data[1], data[2]);
+				if ((data[2] & 0xff) == 0x10)
+					memcpy(last_recv_wifi_ack, &data[2], 12);
+				else
+					memcpy(last_recv_wifi_evt, &data[2], 12);
+				last_ack_time = jiffies;
+				if(data[2] & data_flag)
+					is_cmd = 1;
+				sg_set_buf(sg,  &buffer[offset], size);
+				sg++;
+				offset  += size;
+				data = (int *)&buffer[offset];
+			}
+			if(sg_count >15)
+				dev_info(&port->udev->dev, "rx_submit: port%d packet count %d\n",
+					port->portno, sg_count);
+			if(is_cmd)
+				port = usb_ports[wifi_pdata.cmd_port];
+			port->rx_submit(port->portno, sgs, sg_count, port->rx_data);
+			port->rx_packet_count += sg_count;
+			port = para;
+		}
+		else if(port->state)
+			goto read_msg;
+	}
+	kfree(buffer);
+	dev_info(&port->udev->dev, "%s-port%d is stopped\n", __func__, port->portno);
+	kfree(sgs);
+	if(port->write_urb) {
+		usb_kill_anchored_urbs(&port->write_submitted);
+	}
+	if(port->read_urb) {
+		usb_kill_anchored_urbs(&port->read_submitted);
+	}
+	if(port->write_urb && port->write_urb->context)
+		wait_for_completion_interruptible(port->write_urb->context);
+
+	up(&port->sem);
+	return 0;
+}
 static void skw_usb_kill_wifi_threads(struct usb_port_struct *p)
 {
 	int i;
@@ -1547,27 +1565,15 @@ static void skw_usb_kill_wifi_threads(struct usb_port_struct *p)
 			break;
 		if(port && port->thread) {
 			port->state = 0;
+			usb_kill_anchored_urbs(&port->write_submitted);
+			usb_kill_anchored_urbs(&port->read_submitted);
 		}
 	}
 }
-static void skw_usb_dump_memory(char *buffer, int size, int *log_size)
-{
-	if (log_port->state==2)
-		return;
-	if (size && buffer && log_size) {
-		dump_memory_buffer = buffer;
-		dump_buffer_size = size;
-		dump_log_size = log_size;
-		skw_usb_info("dump_memory : %p-%d\n", buffer, size);
-		schedule_work(&dump_memory_worker);
-	}
-}
-static void show_assert_context(void)
+
+void show_assert_context(void)
 {
 	int read;
-	int error_count;
-	int total_size;
-	int dump_memory_size = 0;
 
 	if(log_port && log_port->state!=2) {
 		char *buffer;
@@ -1575,64 +1581,26 @@ static void show_assert_context(void)
 		if (!buffer)
 			return;
 		open_usb_port(log_port->portno, 0, 0);
-		dump_memory_done = 0;
-		error_count=0;
-		total_size = 0;
 		do {
-			read = bulkin_read_timeout(log_port->portno, buffer, 1024, &read, 10);
-			if (read > 0) {
-				if (total_size + read < dump_buffer_size) {
-					memcpy(&dump_memory_buffer[total_size], buffer, read);
-					dump_memory_size = total_size + read;
-				}
-				total_size += read;
-				memset(buffer, 0, read);
-			}
+			read = bulkin_read_timeout(log_port->portno, buffer, 1024, &read, 1000);
 			if(read == 4 || read < 0) {
 				close_usb_port(log_port->portno);
 				break;
 			}
 		}while(assert_info_print<100);
-		while(!dump_memory_done) {
-			read = bulkin_read_timeout(log_port->portno, buffer, 1024, &read, 10);
-			if (read <= 0) {
-				error_count++;
-				skw_usb_info("%s read = %d : total %d done=%d\n", current->comm, read, total_size, dump_memory_done);
-				if(error_count >1)
-					break;
-			} else {
-				if (total_size + read < dump_buffer_size) {
-					memcpy(&dump_memory_buffer[total_size], buffer, read);
-					dump_memory_size = total_size + read;
-				}
-				total_size += read;
-			}
-		}
-		skw_usb_info("dump memory size: %d buffer_size: %d\n", dump_memory_size, dump_buffer_size);
-		if (dump_log_size)
-			*dump_log_size = dump_memory_size;
 		kfree(buffer);
 	}
 }
-static void dump_memory_work(struct work_struct *work)
-{
-	if(dump_log_size && *dump_log_size==0) {
-		skw_usb_info(" running...\n");
-		show_assert_context();
-	}
-}
-static int usb_loopcheck_entry(void *para)
+
+int usb_loopcheck_entry(void *para)
 {
 	struct usb_port_struct *port = para;
 	char *buffer;
 	int read, size;
 	int count= 0, timeout=300;
 	struct recovery_data *recovery = SKW_USB_GET_RECOVERY_DATA();
-
 	size = 512;
 	buffer = kzalloc(size, GFP_KERNEL);
-	recovery->cp_state = 1;
-	schedule_delayed_work(&skw_except_work , msecs_to_jiffies(6000));
 	while(port->state && buffer){
 		read = 0;
 		memset(buffer,0,512);
@@ -1642,12 +1610,12 @@ static int usb_loopcheck_entry(void *para)
 			read = bulkin_read(port, buffer, 256);
 		}while(!read);
 
-		if (port->suspend) {
+		if (port->suspend && !usb_boot_data->pdev) {
 			msleep(500);
 			continue;
 		}
 		if(read < 0 || !port->state) {
-			skw_usb_err("bulkin read_len=%d\n",read);
+			dev_err(&port->udev->dev, "bulkin read_len=%d\n",read);
 			break;
 		}
 		if(strncmp(buffer, "BSPREADY", read))
@@ -1675,7 +1643,6 @@ static int usb_loopcheck_entry(void *para)
 			bulkout_write(port, buffer+256, 9);
 			//bulkout_write_timeout(port->portno, buffer+256,9, &size, 300);
 		} else if (!strncmp(buffer, "BSPASSERT", 9)) {
-			sprintf(firmware_version, "%s\n%s\n", firmware_version, buffer);
 			skw_usb_err("cmd:0x%x 0x%x 0x%x ack:%x %x:%x event:0x%x:0x%x:0x%x time:0x%x:0x%x:0x%x\n",
 			       last_sent_wifi_cmd[0],last_sent_wifi_cmd[1],last_sent_wifi_cmd[2],
 			       last_recv_wifi_ack[0],last_recv_wifi_ack[1],last_recv_wifi_ack[2],
@@ -1697,16 +1664,18 @@ static int usb_loopcheck_entry(void *para)
 			memset(buffer, 0, read);
 			skw_usb_kill_wifi_threads(port);
 			modem_status = MODEM_HALT;
+			if (!usb_speed_switching)
+				show_assert_context();
 			modem_notify_event(DEVICE_ASSERT_EVENT);
-			if (log_port->state!=2)
-				schedule_work(&dump_memory_worker);
-			memset(buffer, 0, 256);
-			read = bulkin_read_timeout(port->portno, buffer, 256, &read, 1000);
-			if (read > 0)
+#ifndef CONFIG_SEEKWAVE_PLD_RELEASE
+			if (!usb_speed_switching &&(log_port->state==2)){
+				read = bulkin_read(port, buffer, 256);
 				skw_usb_info("bspassert after recv(%d): %s\n", read, buffer);
-			dump_memory_done = 1;
+			}
+#endif
 			modem_notify_event(DEVICE_DUMPDONE_EVENT);
-			msleep(10);
+			if (!usb_speed_switching)
+				msleep(10);
 			skw_recovery_mode();
 			service_state_map =0;
 
@@ -1714,8 +1683,8 @@ static int usb_loopcheck_entry(void *para)
 		} else if (!strncmp("trunk_W", buffer, 7)) {
 #ifdef CONFIG_SKW_DL_TIME_STATS
 			last_time = ktime_get();
-			skw_usb_info(",the download time start time %llu and lasttime %llu ,lose_time=%llu\n",
-				cur_time, last_time,(last_time-cur_time));
+			skw_usb_info("%s,the download time start time %llu and lasttime %llu ,lose_time=%llu\n",
+				__func__, cur_time, last_time,(last_time-cur_time));
 #endif
 			cancel_delayed_work_sync(&skw_except_work);
 			recovery->cp_state = 0;
@@ -1736,7 +1705,7 @@ static int usb_loopcheck_entry(void *para)
 		wait_for_completion_interruptible_timeout(&loop_completion, msecs_to_jiffies(timeout));
 		skw_reinit_completion(loop_completion);
 	}
-	skw_usb_info(" -port%d is stopped\n", port->portno);
+	dev_info(&port->udev->dev, "%s-port%d is stopped\n", __func__, port->portno);
 	if(port->read_urb && port->read_urb->context) {
 		usb_kill_anchored_urbs(&port->read_submitted);
 	}
@@ -1769,13 +1738,13 @@ static int usb_bt_rx_entry(void *para)
 		}while(!read);
 
 		if(read < 0) {
-			skw_usb_err("bulkin read_len=%d\n",read);
+			dev_err(&port->udev->dev, "bulkin read_len=%d\n",read);
 			break;
 		}
 		if(port->rx_submit)
 			port->rx_submit(port->portno, port->rx_data, read, buffer);
 	}
-	skw_usb_info("-port%d is stopped\n", port->portno);
+	dev_info(&port->udev->dev, "%s-port%d is stopped\n", __func__, port->portno);
 	if(port->write_urb && port->write_urb->context) {
 		usb_kill_anchored_urbs(&port->write_submitted);
 	}
@@ -1809,9 +1778,15 @@ static struct sv6160_platform_data ucom_pdata = {
 	.service_stop = bt_service_stop,
 	.modem_register_notify = modem_register_notify,
 	.modem_unregister_notify = modem_unregister_notify,
-	.dump_modem_memory = skw_usb_dump_memory,
+	.skw_dump_mem = skw_usb_dump_read,
 };
 
+
+
+static int skw_usb_dump_read(unsigned int address, void *buf, unsigned int len)
+{
+	return 0;
+}
 /************************************************************************
  *Decription:
  *Author:jiayong.yang
@@ -1886,7 +1861,6 @@ static int register_tx_callback(int id, void *func, void *para)
 static int skw_usb_io_probe(struct usb_interface *interface,
 				const struct usb_device_id *id)
 {
-	struct recovery_data *recovery = SKW_USB_GET_RECOVERY_DATA();
 	struct usb_port_struct *port;
 	struct usb_host_interface *iface_desc;
 	struct usb_endpoint_descriptor *epd;
@@ -1912,21 +1886,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 	port = kzalloc(sizeof(*port), GFP_KERNEL);
 	if (!port)
 		return -ENOMEM;
-	if (iface_desc->endpoint[0].desc.wMaxPacketSize == 512) {
-		mutex_lock(&recovery->except_mutex);
-		if (usb_bus_num == 0xff && usb_port_num == 0xff) {
-			usb_bus_num = udev->bus->busnum;
-			usb_port_num = udev->portnum;
-			skw_usb_info("bus[%x].port[%d]: driver %d:%d\n", udev->bus->busnum, udev->portnum,
-				usb_bus_num, usb_port_num);
-		} else if (usb_bus_num != udev->bus->busnum || usb_port_num != udev->portnum) {
-			mutex_unlock(&recovery->except_mutex);
-			if (port)
-				kfree(port);
-			return -EBUSY;
-		}
-		mutex_unlock(&recovery->except_mutex);
-	}
+
 	pdev = NULL;
 	if (!strncmp(names, "WIFITCMD", 8))
 		wifi_port_share = 1;
@@ -1962,7 +1922,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 			ucom_pdata.data_port = 0;
 		} else if(!strncmp(names, "BTDATA", 6))
 			ucom_pdata.data_port = iface_desc->desc.bInterfaceNumber;
-		else if(!strncmp(names, "BTCMD", 5))
+		else if(!strncmp(names, "BTCMD", 5)){
 			ucom_pdata.cmd_port = iface_desc->desc.bInterfaceNumber;
 		else if(!strncmp(names, "BTISOC", 6)) {
 			ucom_pdata.audio_port = iface_desc->desc.bInterfaceNumber;
@@ -1976,14 +1936,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 			bluetooth_pdev->dev.coherent_dma_mask = port_dmamask;
 			bt_audio_port = iface_desc->desc.bInterfaceNumber;
 			memcpy(ucom_pdata.chipid, skw_chipid, SKW_CHIP_ID_LENGTH);
-			ret = platform_device_add_data(bluetooth_pdev, &ucom_pdata, sizeof(ucom_pdata));
-			if(ret) {
-				skw_usb_err("failed to add platform data \n");
-				platform_device_put(pdev);
-				kfree(port);
-				return ret;
-			}
-			skw_usb_info("add the bt devices \n");
+			platform_device_add_data(bluetooth_pdev, &ucom_pdata, sizeof(ucom_pdata));
 		}else if(!strncmp(names, "AUDIO", 5)) {
 			ucom_pdata.audio_port = 0;
 			sprintf(pdev_name, "%s", "btseekwave");
@@ -1996,13 +1949,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 			bluetooth_pdev->dev.coherent_dma_mask = port_dmamask;
 			bt_audio_port = iface_desc->desc.bInterfaceNumber;
 			memcpy(ucom_pdata.chipid, skw_chipid, SKW_CHIP_ID_LENGTH);
-			ret = platform_device_add_data(bluetooth_pdev, &ucom_pdata, sizeof(ucom_pdata));
-			if(ret) {
-				skw_usb_err("failed to add platform data \n");
-				platform_device_put(pdev);
-				kfree(port);
-				return ret;
-			}
+			platform_device_add_data(bluetooth_pdev, &ucom_pdata, sizeof(ucom_pdata));
 		} else
 #endif
 		if (iface_desc->desc.bInterfaceNumber && strncmp(names, "LOOP", 4)) {
@@ -2030,6 +1977,9 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 			if (1==iface_desc->desc.bInterfaceNumber &&
 			    usb_boot_data && usb_boot_data->pdev) {
 				pdev->dev.parent = &usb_boot_data->pdev->dev;
+#ifdef REINIT_USB_STR
+				wifi_pdata.bus_type |= REINIT_USB_STR;
+#endif
 			} else
 				pdev->dev.parent = &udev->dev;
 			pdev->dev.dma_mask = &port_dmamask;
@@ -2052,7 +2002,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 				ret = platform_device_add_data(pdev, &ucom_pdata, sizeof(ucom_pdata));
 			}
 			if(ret) {
-				skw_usb_err("failed to add platform data \n");
+				dev_err(&udev->dev, "failed to add platform data \n");
 				platform_device_put(pdev);
 				kfree(port);
 				return ret;
@@ -2060,7 +2010,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 			if(iface_desc->desc.bInterfaceNumber>1){
 				ret = platform_device_add(pdev);
 				if(ret) {
-					skw_usb_err("failt to register platform device\n");
+					dev_err(&udev->dev, "failt to register platform device\n");
 					platform_device_put(pdev);
 					kfree(port);
 					return ret;
@@ -2074,7 +2024,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 	port->interface = usb_get_intf(interface);
 	port->udev = usb_get_dev(udev);
 	/* register struct wcn_usb_intf */
-	skw_usb_dbg("intf[%x] is registerred: ep count %d %s\n",
+	dev_dbg(&port->udev->dev, "intf[%x] is registerred: ep count %d %s\n",
 			iface_desc->desc.bInterfaceNumber,
 			iface_desc->desc.bNumEndpoints,
 			iface_desc->string);
@@ -2082,7 +2032,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 	for(i=0; i<iface_desc->desc.bNumEndpoints; i++) {
 
 		epd = &iface_desc->endpoint[i].desc;
-		port->buffer_size = 5120;
+		port->buffer_size = MAX_BUFFER_SIZE;
 		port->ep_mps = epd->wMaxPacketSize;
 		if(usb_endpoint_is_bulk_in(epd)) {
 			port->epin = epd;
@@ -2103,7 +2053,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 				bulkin_complete, port);
 			port->read_urb->context = NULL;
 			init_usb_anchor(&port->read_submitted);
-			skw_usb_dbg("BulkinEP = 0x%x rp=%p\n",
+			dev_dbg(&pdev->dev, "BulkinEP = 0x%x rp=%p\n",
 					epd->bEndpointAddress, port->read_buffer);
 		} else if(usb_endpoint_is_bulk_out(epd)) {
 			port->epout = epd;
@@ -2123,7 +2073,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 				port->write_buffer, port->buffer_size, bulkout_complete,port);
 			port->write_urb->context = NULL;
 			init_usb_anchor(&port->write_submitted);
-			skw_usb_dbg("BulkoutEP = 0x%x wp =%p context %p\n",
+			dev_dbg(&pdev->dev, "BulkoutEP = 0x%x wp =%p context %p\n",
 					epd->bEndpointAddress, port->write_buffer, port->write_urb->context);
 		}
 	}
@@ -2141,6 +2091,8 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 			} else {
 				wifi_pdata.cmd_port = port->portno;
 				wifi_pdata.data_port = 1 - port->portno;
+				if(!strncmp(names, "WIFICMD", 7))
+					port->thread = kthread_create(usb_port_entry, port, iface_desc->string);
 			}
 			if(port->thread) {
 				sema_init(&port->sem, 0);
@@ -2150,7 +2102,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 		} else if(!strncmp(names, "LOOP", 4)) {
 			sema_init(&port->sem, 0);
 			port->thread = kthread_create(usb_loopcheck_entry, port, iface_desc->string);
-			if (port->thread)
+			if(port->thread)
 				wake_up_process(port->thread);
 		} else	sema_init(&port->sem, 1);
 	} else {
@@ -2171,7 +2123,7 @@ static int skw_usb_io_probe(struct usb_interface *interface,
 		log_port = port;
 	return 0;
 err0:
-	skw_usb_err("no memory  to register device\n");
+	dev_err(&udev->dev, "no memory  to register device\n");
 	if(port->write_buffer)
 		kfree(port->write_buffer);
 	if(port->read_buffer)
@@ -2213,29 +2165,93 @@ static int launch_download_work(char *data, int size,int addr)
 
 static int skw_recovery_mode(void)
 {
-	int ret=0;
-	if(!cls_recovery_mode_en) {
-		if (chip_en_gpio >= 0) {
-			gpio_set_value(chip_en_gpio, 0);
-			skw_usb_info("set chip enable reset\n");
-			msleep(80);
-			gpio_set_value(chip_en_gpio, 1);
-		} else {
-			if(usb_ports[0] && usb_ports[0]->udev) {
-				ret = usb_control_msg(usb_ports[0]->udev,
-					usb_sndctrlpipe(usb_ports[0]->udev, 0),
-					VENDOR_MSG_MODEM_RESET,
-					USB_DIR_OUT| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
-					0,0,NULL,0,100);
-				skw_usb_info("reset ret = %d\n", ret);
-				if (ret == -ETIMEDOUT)
-					usb_reset_device(usb_ports[0]->udev);
-			}
-		}
+	if (chip_en_gpio > 0  &&
+	   (usb_speed_switching || !cls_recovery_mode_en)) {
+		gpio_set_value(chip_en_gpio, 0);
+		if (usb_ports[0])
+			usb_reset_device(usb_ports[0]->udev);
+
+		skw_usb_info("set chip enable reset\n");
+		msleep(30);
+		gpio_set_value(chip_en_gpio, 1);
 	}
-	return ret;
+	usb_speed_switching = 0;
+	return 0;
 }
 
+void get_bt_antenna_mode(char *mode)
+{
+	struct seekwave_device *boot_data = usb_boot_data;
+	u32 bt_antenna = boot_data->bt_antenna;
+
+	if(bt_antenna==0)
+		return;
+	bt_antenna--;
+	if(!mode)
+		return;
+	if (bt_antenna)
+		sprintf(mode,"bt_antenna : alone\n");
+	else
+		sprintf(mode,"bt_antenna : share\n");
+}
+
+void reboot_to_change_bt_antenna_mode(char *mode)
+{
+	struct seekwave_device *boot_data = usb_boot_data;
+	u32 *data = (u32 *) &boot_data->iram_img_data[boot_data->nv_head_addr + 4];
+	u32 bt_antenna;
+
+	if(boot_data->bt_antenna == 0)
+		return;
+	bt_antenna = boot_data->bt_antenna - 1;
+	bt_antenna = 1 - bt_antenna;
+	data[0] &= ~0x01;
+		data[0] |= bt_antenna;
+	if (bt_antenna==1) {
+		boot_data->bt_antenna = 2;
+		sprintf(mode,"bt_antenna : alone\n");
+	} else {
+		boot_data->bt_antenna = 1;
+		sprintf(mode,"bt_antenna : share\n");
+	}
+	
+	modem_assert();
+
+}
+
+void get_USB_speed_mode(char *mode)
+{
+	if (wifi_pdata.align_value == 1024)
+		sprintf(mode,"MAX_SPEED=SUPER\n");
+	else
+		sprintf(mode,"MAX_SPEED=HIGH\n");
+}
+
+void reboot_to_change_USB_speed_mode(char *mode)
+{
+	struct seekwave_device *boot_data = usb_boot_data;
+	u32 *data = (u32 *) &boot_data->iram_img_data[boot_data->nv_head_addr + 4];
+
+	data[0] &= ~0x0C;
+	if (wifi_pdata.align_value == 1024) {
+		data[0] |= 0x04;
+		sprintf(mode,"MAX_SPEED=HIGH\n");
+	} else {
+		sprintf(mode,"MAX_SPEED=SUPER\n");
+	}
+	usb_speed_switching = 1;
+	skw_usb_info("offset %d : 0x%x\n", boot_data->nv_head_addr, data[0]);
+	modem_assert();
+}
+
+void reboot_to_change_bt_uart1(char *mode)
+{
+	struct seekwave_device *boot_data = usb_boot_data;
+	u32 *data = (u32 *) &boot_data->iram_img_data[boot_data->nv_head_addr + 4];
+
+	data[0] |= 0x0000002;
+	modem_assert();
+}
 static irqreturn_t skw_gpio_irq_handler(int irq, void *dev_id)
 {
 	int     value = gpio_get_value(host_wake_gpio);
@@ -2256,8 +2272,9 @@ int skw_boot_loader(struct seekwave_device *boot_data)
 	if (usb_ports[0] && usb_ports[0]->suspend)
 		return -EOPNOTSUPP;
 	usb_boot_data= boot_data;
-	skw_usb_info("status:%d , chip_en_gpio=%d, gpio_in=%d", modem_status,
-		       	usb_boot_data->chip_en, usb_boot_data->gpio_in);
+	skw_usb_info("status:%d , the dma_type = 0x%08x ,chip_en_gpio=%d, gpio_in=%d", modem_status,
+		TX_DMA_TYPE,usb_boot_data->chip_en, usb_boot_data->gpio_in);
+
 	chip_en_gpio = usb_boot_data->chip_en;
 #ifdef CONFIG_SKW_DL_TIME_STATS
 	cur_time = ktime_get();
@@ -2311,14 +2328,14 @@ void *skw_get_bus_dev(void)
 {
 	int time_count=0;
 	if(modem_status == MODEM_OFF && !usb_ports[0]) {
-		skw_usb_err(" power on USB\n");
+		skwusb_err("%s power on USB\n", __func__);
 		do{
 			msleep(10);
 			time_count++;
 		}while(!usb_ports[0] && time_count < 50);
 	}
 	if(!usb_ports[0] || !usb_ports[0]->state || !usb_ports[0]->udev){
-		skw_usb_err(" the port open device fail !!!\n");
+		skwusb_err("%s the port open device fail !!!\n", __func__);
 		return NULL;
 	}
 	return &usb_ports[0]->udev->dev;
@@ -2333,29 +2350,16 @@ void *skw_get_bus_dev(void)
  ********************************************************************* */
 int skw_reset_bus_dev(void)
 {
-	struct usb_port_struct *port=NULL;
-	int ret = 0;
-	if(chip_en_gpio >= 0) {
-		gpio_set_value(chip_en_gpio, 0);
-		skw_usb_info(" chip reset!!\n");
-		msleep(80);
-		gpio_set_value(chip_en_gpio, 1);
-	} else {
-		port = usb_ports[0];
-		if(!port){
-			skw_usb_info("usb_ports[0] is NULL\n");
-			return -1;
-		}
-		if(port && port->udev) {
-			ret = usb_control_msg(port->udev, usb_sndctrlpipe(port->udev, 0),
-				VENDOR_MSG_MODEM_RESET,
-				USB_DIR_OUT| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
-				0,0,NULL,0,100);
-		} else {
-			skw_usb_info("usb_ports[0] or udev is NULL\n");
-		}
-		skw_usb_info("ret = %d\n", ret);
-	}
+	struct usb_port_struct *port;
+	int ret = -1;
+
+	port = usb_ports[0];
+	if (port == NULL)
+		return 0;
+
+	ret = usb_control_msg(port->udev, usb_sndctrlpipe(port->udev, 0),
+			VENDOR_MSG_MODEM_RESET, USB_DIR_OUT| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
+			0,0,NULL,0,100);
 	return ret;
 }
 
@@ -2404,22 +2408,21 @@ static void skw_usb_io_disconnect(struct usb_interface *interface)
 	if(!port->is_dloader) {
 		if (infno > 1)
 			platform_device_unregister(port->pdev);
-		if (infno == 1) {
+		if (infno == 1)
 			wake_up_interruptible(&port->rx_wait);
-			wake_up_interruptible(&port->tx_wait);
-		}
 		if (modem_status==MODEM_ON) {
 			if(wifi_data_pdev && &port->udev->dev == wifi_data_pdev->dev.parent) {
-				if(recovery->cp_state == 0)
-					modem_notify_event(DEVICE_DISCONNECT_EVENT);
-				platform_device_unregister(wifi_data_pdev);
+				platform_device_unregister(port->pdev);
 				wifi_data_pdev = NULL;
-				skw_usb_info("WIFI device disconnected1!!!\n");
 			}
 		}
 		if (port->pdev == wifi_data_pdev && port->suspend) {
 			modem_notify_event(DEVICE_DISCONNECT_EVENT);
 			tasklet_kill(&port->tasklet);
+			if(!recovery->cp_state){
+				recovery->cp_state = 1;
+				schedule_delayed_work(&skw_except_work , msecs_to_jiffies(20000));
+			}
 		}
 		skw_usb_io_free_suspend_urbs(interface);
 		if(port->read_urb && port->read_urb->context)
@@ -2433,11 +2436,11 @@ static void skw_usb_io_disconnect(struct usb_interface *interface)
 	if(port->read_urb && !port->read_urb->context) {
 		kfree(port->read_urb);
 		port->read_urb = NULL;
-	} else skw_usb_err(" memory leak port.r%d!!!!!!!!\n", infno);
+	} else skw_usb_info("%s memory leak port.r%d!!!!!!!!\n", __func__, infno);
 	if(port->write_urb && !port->write_urb->context) {
 		kfree(port->write_urb);
 		port->write_urb = NULL;
-	} else skw_usb_err(" memory leak port.w%d!!!!!!!!\n", infno);
+	} else skw_usb_info("%s memory leak port.w%d!!!!!!!!\n", __func__, infno);
 	if(port->read_buffer)
 		kfree(port->read_buffer);
 	if(port->write_buffer)
@@ -2451,18 +2454,12 @@ static void skw_usb_io_disconnect(struct usb_interface *interface)
 		usb_free_urb(urb);
 	}
 	spin_unlock_irqrestore(&port->rx_urb_lock, flags);
-
+	usb_ports[infno]->udev = NULL;
 	usb_ports[infno] = NULL;
 	usb_set_intfdata(interface, NULL);
 	usb_put_dev(port->udev);
 	usb_put_intf(interface);
 	kfree(port);
-	if (chip_en_gpio >= 0 && MODEM_DOWNLOAD_FAILED == modem_status) {
-		modem_status = MODEM_HALT;
-		msleep(50);
-		gpio_set_value(chip_en_gpio, 1);
-		skw_usb_info("retry to boot device\n");
-	}
 }
 
 /************************************************************************
@@ -2504,19 +2501,14 @@ static int skw_usb_io_suspend(struct usb_interface *interface, pm_message_t mess
 	struct usb_port_struct *port;
 	struct recovery_data *recovery = SKW_USB_GET_RECOVERY_DATA();
 
+	if (service_state_map & (1<<BT_SERVICE))
+		skw_BT_service_stop();
+
 	port = usb_get_intfdata(interface);
 
-	if(usb_ports[1] == port) {
-		int ret;
-		u16 *count = (u16 *)port->read_buffer;
-		
-		modem_notify_event(DEVICE_SUSPEND_EVENT);
-		ret = usb_control_msg(port->udev, usb_rcvctrlpipe(port->udev, 0),
-				VENDOR_MSG_MODEM_SUSP, USB_DIR_IN| USB_TYPE_VENDOR|USB_RECIP_DEVICE,
-				1, 0, port->read_buffer, 2, 10);
-		skw_usb_info("RET = %d  packet suspended = %d\n", ret, *count);
-		if (*count)
-			msleep(10);
+	if(usb_ports[0] && usb_ports[0]->write_urb->context) {
+		msleep(10);
+		skw_usb_info("retry to send WIFI command\n");
 	}
 	if (port->tx_urb_count)
 		usb_kill_anchored_urbs(&port->write_submitted);
@@ -2535,41 +2527,20 @@ static int skw_usb_io_suspend(struct usb_interface *interface, pm_message_t mess
 }
 static int skw_usb_io_resume(struct usb_interface *interface)
 {
-	int	 retval = -1;
 	struct usb_port_struct *port;
 	struct urb *urb;
 	port = usb_get_intfdata(interface);
 
 	skw_usb_info("port%d enter...\n", port->portno);
+	port->suspend = 0;
 	while(!list_empty(&port->suspend_urb_list)) {
 		urb = list_first_entry(&port->suspend_urb_list, struct urb, urb_list);
 		list_del_init(&urb->urb_list);
 		if(port->portno == wifi_pdata.data_port)
 			urb->context = port;
 		usb_anchor_urb(urb, &port->read_submitted);
-		retval = usb_submit_urb(urb, GFP_KERNEL);
-		if (retval < 0) {
-			usb_unanchor_urb(urb);
-			skw_usb_info("is error!!! %d\n", retval);
-			return retval;
-		}
+		usb_submit_urb(urb, GFP_KERNEL);
 	}
-	if (usb_ports[1]==port && port->suspend==1) {
-		port->suspend = 0;
-		modem_notify_event(DEVICE_RESUME_EVENT);
-	}
-	port->suspend = 0;
-	return 0;
-}
-static int skw_usb_io_reset_resume(struct usb_interface *interface)
-{
-	struct usb_port_struct *port;
-
-	skw_usb_info("enter...\n");
-	port = usb_get_intfdata(interface);
-	if (port)
-		port->suspend++;
-	skw_usb_io_resume(interface);
 	return 0;
 }
 #endif
@@ -2588,7 +2559,6 @@ struct usb_driver skw_usb_io_driver = {
 #ifdef CONFIG_PM
         .suspend   = skw_usb_io_suspend,
         .resume    = skw_usb_io_resume,
-        .reset_resume = skw_usb_io_reset_resume,
 #endif	
 	.pre_reset = skw_usb_io_pre_reset,
 	.post_reset = skw_usb_io_post_reset,
@@ -2602,18 +2572,13 @@ struct usb_driver skw_usb_io_driver = {
  */
 static int __init skw_usb_io_init(void)
 {
-	usb_bus_num = 0xff;
-	usb_port_num = 0xff;
 	wifi_data_pdev = NULL;
 	bluetooth_pdev = NULL;
 	log_port = NULL;
 	usb_boot_data = NULL;
-#ifndef CONFIG_SEEKWAVE_PLD_RELEASE
-	cls_recovery_mode_en = 1;
-#else
 	cls_recovery_mode_en = 0;
-#endif
 	wifi_port_share = 0;
+	usb_speed_switching = 0;
 	memset(usb_ports, 0, sizeof(usb_ports));
 	init_completion(&download_done);
 	init_completion(&loop_completion);
@@ -2626,10 +2591,6 @@ static int __init skw_usb_io_init(void)
 	mutex_init(&g_recovery_data.except_mutex);
 	INIT_DELAYED_WORK(&skw_except_work, skw_usb_exception_work);
 	INIT_WORK(&add_device_work, add_devices_work);
-	INIT_WORK(&dump_memory_worker, dump_memory_work);
-	INIT_WORK(&usb_control_worker, usb_control_work);
-	dump_memory_buffer = NULL;
-	dump_buffer_size = 0;
 	usb_register(&skw_usb_io_driver);
 	return seekwave_boot_init();
 }
@@ -2654,6 +2615,7 @@ static void __exit skw_usb_io_exit(void)
 		skw_usb_info("reset SKWUSB device");
 		skw_reset_bus_dev();
 	}
+		
 	if (usb_boot_data && usb_boot_data->pdev && wifi_data_pdev &&
 	    wifi_data_pdev->dev.parent == &usb_boot_data->pdev->dev) {
 		skw_usb_info("unregister WIFI device\n");
@@ -2662,11 +2624,8 @@ static void __exit skw_usb_io_exit(void)
 		ret = 0;
 	}
 	seekwave_boot_exit();
-	skw_usb_debugfs_deinit();
 	cancel_delayed_work_sync(&skw_except_work);
 	cancel_work_sync(&add_device_work);
-	cancel_work_sync(&dump_memory_worker);
-	cancel_work_sync(&usb_control_worker);
 	mutex_destroy(&g_recovery_data.except_mutex);
 	skw_usb_wakeup_source_destroy();
 	if(bluetooth_pdev)

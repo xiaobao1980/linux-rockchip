@@ -10,12 +10,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
  */
-#include "asm-generic/errno-base.h"
-#include "asm/io.h"
-#include "linux/compiler.h"
-#include "linux/irqreturn.h"
-#include "linux/pci.h"
-#include "linux/types.h"
 #include <linux/platform_device.h>
 #include <uapi/linux/sched/types.h>
 #include <linux/scatterlist.h>
@@ -32,31 +26,21 @@
 #include <linux/iopoll.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
-#include <linux/fs.h>
 #include "skw_edma_drv.h"
 #include "skw_pcie_drv.h"
 #include "skw_pcie_log.h"
 #include "skw_edma_reg.h"
 #include "skw_pcie_debugfs.h"
-#include "dbgbus.h"
 
 #define SWT6652_V2
 //#define SBDRSM_DEBUG
 
 static struct wcn_pcie_info *g_pcie_dev;
-int cp_boot = 0;
 
-#if (CONFIG_PCIE_INT_TYPE == INT_MSI)
 static int pcie_int = 1;
-#elif (CONFIG_PCIE_INT_TYPE == INT_LEGACY_INTX)
-static int pcie_int = 2;
-#elif (CONFIG_PCIE_INT_TYPE == INT_MSIX)
-static int pcie_int = 3;
-#endif
 module_param(pcie_int, int, S_IRUGO);
-module_param(cp_boot, int, S_IRUGO);
 MODULE_PARM_DESC(pcie_int, "1-msi, 2-legacy, 3-msix, if no param, msi default");
-MODULE_PARM_DESC(cp_boot, "0-ap boot, 1-cp boot, if no param, ap boot default");
+
 
 extern void skw_pcie_exception_work(struct work_struct *work);
 
@@ -84,7 +68,6 @@ static int inline is_msi_irq_wifi_takeover(struct wcn_pcie_info *priv, int irq)
 		return 0;
 }
 
-#if !defined(CONFIG_SKW_MSI_AS_LEGACY) || defined(CONFIG_MSIX_SUPPORT)
 static int skw_pcie_msi_irq(int irq, void *arg)
 {
 	struct wcn_pcie_info *priv = get_pcie_device_info();
@@ -100,7 +83,6 @@ static int skw_pcie_msi_irq(int irq, void *arg)
 
 	return IRQ_HANDLED;
 }
-#endif
 
 static int legacy_pcie_irq_handle(struct wcn_pcie_info *priv)
 {
@@ -112,9 +94,9 @@ static int legacy_pcie_irq_handle(struct wcn_pcie_info *priv)
 	return IRQ_HANDLED;
 }
 
-static irqreturn_t pcie_legacy_irq(int irq, void *arg)
+static int pcie_legacy_irq(int irq, void *arg)
 {
-	struct wcn_pcie_info *priv = (struct wcn_pcie_info *)arg;
+	struct wcn_pcie_info *priv = arg;
 
 	PCIE_DBG("irq_num=%d\n", irq);
 	if (skw_pcie_read32(0x40188004))
@@ -125,26 +107,16 @@ static irqreturn_t pcie_legacy_irq(int irq, void *arg)
 	return IRQ_HANDLED;
 }
 
-static void ib_map(struct wcn_pcie_info *priv, u32 cp_addr, u64 ap_addr, u32 map_size, u32 ibreg_off)
-{
-	writel_relaxed((ap_addr & 0xffff0000) | (ilog2(map_size) - 1), priv->pciaux + ibreg_off + 4);
-	writel_relaxed((ap_addr >> 32) & 0xffffffff, priv->pciaux + ibreg_off + 8);
-	writel_relaxed(cp_addr, priv->pciaux + ibreg_off + 0xc);
-	writel_relaxed(1, priv->pciaux + ibreg_off + 0);
-}
-
 static int ep_address_mapping(struct wcn_pcie_info *priv)
 {
-	//ib0: map 2M(0x2000000) (0x40000000-0x401fffff)
-	ib_map(priv, 0x40000000, priv->mem_pciaddr, 0x200000, IBREG0_OFFSET_ADDR);
-	//ib1:IRAM 1M (0x100000-0x1FFFFF)
-	ib_map(priv, 0x100000, priv->mem_pciaddr + 0x200000, 0x100000, IBREG1_OFFSET_ADDR);
-	//ib2:DRAM 1M (0x20200000-0x202FFFFF)
-	ib_map(priv, 0x20200000, priv->mem_pciaddr + 0x300000, 0x100000, IBREG2_OFFSET_ADDR);
-	if (priv->dev->device != 0x6316) {
-		//ib4:up sys 1M(0x40310000-0x4032FFFF)
-		ib_map(priv, 0x40310000, priv->dump_pciaddr + 0x200000, 0x100000, IBREG4_OFFSET_ADDR);
-	}
+	u64 val;
+	//ib: map 2M(0x2000000) (0x40000000-0x401fffff)
+	val = priv->mem_pciaddr;
+	writel_relaxed((val & 0xffff0000) | 20, priv->pciaux + IBREG0_OFFSET_ADDR + 4);
+	writel_relaxed((val >> 32) & 0xffffffff, priv->pciaux + IBREG0_OFFSET_ADDR + 8);
+	writel_relaxed(0x40000000, priv->pciaux + IBREG0_OFFSET_ADDR + 0xc);
+	writel_relaxed(1, priv->pciaux + IBREG0_OFFSET_ADDR + 0);
+
 #ifdef SWT6652_V2
 	//ob0
 	writel_relaxed(31, priv->pciaux + OBREG0_OFFSET_ADDR + 4);
@@ -171,25 +143,6 @@ static int ep_address_mapping(struct wcn_pcie_info *priv)
 	return 0;
 }
 
-int skw_pcie_mem_dump(unsigned int system_addr, void *buf,unsigned int len)
-{
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-	u32 addrl16, addrh16;
-
-	addrl16 = system_addr & 0xffff;
-	addrh16 = system_addr & 0xffff0000;
-
-
-	if (!pci_device_is_present(priv->dev)) {
-		PCIE_ERR("PCIe link is Down!!!\n");
-		return -ENODEV;
-	}
-	//ib3:2M (0x200000)
-	ib_map(priv, addrh16, priv->dump_pciaddr, 0x200000, IBREG3_OFFSET_ADDR);
-	memcpy_fromio(buf, priv->pcidump + addrl16, len);
-
-	return 0;
-}
 
 u32 skw_pcie_read32(u32 reg_addr)
 {
@@ -275,111 +228,15 @@ u64 edma_pcieaddr_to_virtaddr(u64 phy_addr)
 	return virt_addr;
 }
 
-static size_t buffer_dump_swd_len = 0;
-u8 swdata_dump[0x2000]; // 8k buffer
-
-ssize_t skw_pcie_swd_read(char __user *buffer, size_t length, loff_t *offset)
-{
-	size_t bytes_to_read;
-	ssize_t bytes_read;
-
-	if (*offset >= buffer_dump_swd_len) {
-		return 0;
-	}
-
-	bytes_to_read = min(length, buffer_dump_swd_len - (size_t)*offset);
-
-	if (copy_to_user(buffer, swdata_dump + *offset, bytes_to_read)) {
-		return -EFAULT;
-	}
-
-	*offset += bytes_to_read;
-	bytes_read = bytes_to_read;
-
-	return bytes_read;
-}
-
-void skw_pcie_swdump(void)
-{
-	int i, j;
-	u32 word;
-	u32 sys_cnt;
-	sys_grps_t dbgbus;
-	char *ptr_dump_swd;
-	sys_t *sys_sig_sel;
-	pcie_misc_ctrl_0_t misc_ctrl0;
-	static char *buffer_dump_swd = NULL;
-	struct wcn_pcie_info *priv = get_pcie_device_info();
-
-	if (!pci_device_is_present(priv->dev)) {
-		PCIE_ERR("PCIe link is Down!!!\n");
-		return;
-	}
-
-	if (priv->dev->device == 0x6316) {
-		sys_sig_sel = SIG_SEL(6652);
-		sys_cnt = sizeof(SIG_SEL(6652))/sizeof(SIG_SEL(6652)[0]);
-	} else if (priv->dev->device == 0x6315) {
-		sys_sig_sel = SIG_SEL(6652s);
-		sys_cnt = sizeof(SIG_SEL(6652s))/sizeof(SIG_SEL(6652s)[0]);
-	} else
-		return;
-
-	for (i = 0;i < sys_cnt; i++) {
-		dbgbus.sys_name[i] = sys_sig_sel[i].sys_name;
-		dbgbus.sys_sel[i] = sys_sig_sel[i].sys_sel;
-		dbgbus.sig_sel[i] = sys_sig_sel[i].sig_sel;
-		dbgbus.sig_cnt[i] = sys_sig_sel[i].sig_cnt;
-		buffer_dump_swd_len += dbgbus.sig_cnt[i] * 4 * 3;
-	}
-
-	buffer_dump_swd = kzalloc(buffer_dump_swd_len, GFP_KERNEL);
-	if (!buffer_dump_swd) {
-		PCIE_ERR("failed to alloc mem\n");
-		return;
-	}
-	ptr_dump_swd = buffer_dump_swd ;
-	PCIE_INFO("buffer_dump_swd_len:%d\n", buffer_dump_swd_len);
-
-	for (i = 0; i < sys_cnt; i++) {
-		PCIE_INFO("======sys: %s(%d), sig_num: %d======\n", dbgbus.sys_name[i], dbgbus.sys_sel[i], dbgbus.sig_cnt[i]);
-		for (j = 0; j < dbgbus.sig_cnt[i]; j++) {
-			/* sel sys|sig */
-			pci_read_config_dword(priv->dev,PCIE_MISC_CTRL_0, &misc_ctrl0.reg_val);
-			misc_ctrl0.enable = 1;
-			misc_ctrl0.sys_sel = dbgbus.sys_sel[i];
-			misc_ctrl0.signals_sel = dbgbus.sig_sel[i][j];
-			pci_write_config_dword(priv->dev, PCIE_MISC_CTRL_0, misc_ctrl0.reg_val);
-			pci_read_config_dword(priv->dev, PCIE_MISC_STATUS_0, &word);
-			PCIE_INFO("sys: %s, sig_sel: %d, word: 0x%08x\n", dbgbus.sys_name[i], dbgbus.sig_sel[i][j], word);
-
-			//write data to buffer
-			memcpy(ptr_dump_swd, (char *)&dbgbus.sys_sel[i], 4);
-			ptr_dump_swd += 4;
-			memcpy(ptr_dump_swd, (char *)&dbgbus.sig_sel[i][j], 4);
-			ptr_dump_swd += 4;
-			memcpy(ptr_dump_swd, (char *)&word, 4);
-			ptr_dump_swd += 4;
-		}
-	}
-	//print_hex_dump(KERN_ERR, "dump_swd:", 0, 16, 1, buffer_dump_swd, buffer_dump_swd_len, 1);
-	//recover misc_ctrl0
-	pci_read_config_dword(priv->dev,PCIE_MISC_CTRL_0, &misc_ctrl0.reg_val);
-	misc_ctrl0.enable = 0;
-	pci_write_config_dword(priv->dev, PCIE_MISC_CTRL_0, misc_ctrl0.reg_val);
-	memcpy(swdata_dump, buffer_dump_swd, buffer_dump_swd_len);
-	kfree(buffer_dump_swd);
-}
-
 static void skw_pcie_remove(struct pci_dev *pdev)
 {
-#ifdef CONFIG_MSIX_SUPPORT
 	int i;
-#endif
 	struct wcn_pcie_info *priv;
 
-	PCIE_INFO("[+]\n");
+	PCIE_DBG("[+]\n");
 	priv = (struct wcn_pcie_info *) pci_get_drvdata(pdev);
+
+	skw_edma_deinit();
 
 	if (priv->legacy_en == 1) {
 		PCIE_INFO("free INTx int");
@@ -395,7 +252,6 @@ static void skw_pcie_remove(struct pci_dev *pdev)
 #endif
 		pci_disable_msi(pdev);
 	}
-#ifdef CONFIG_MSIX_SUPPORT
 	if (priv->msix_en == 1) {
 		PCIE_INFO("free MSI-X");
 		for (i = 0; i < priv->irq_num; i++)
@@ -404,25 +260,17 @@ static void skw_pcie_remove(struct pci_dev *pdev)
 		pci_disable_msix(pdev);
 		kfree(priv->msix);
 	}
-#endif
-	if (priv->boot_data->gpio_in != -1) {
-		free_irq(priv->gpio_irq_num, NULL);
-		disable_irq_wake(priv->gpio_irq_num);
-	}
 
-	PCIE_INFO("deinit edma\n");
-	skw_edma_deinit();
-	PCIE_INFO("unmap pci\n");
+	free_irq(priv->gpio_irq_num, NULL);
+	disable_irq_wake(priv->gpio_irq_num);
+
 	iounmap(priv->pcimem);
 	iounmap(priv->pciaux);
-	PCIE_INFO("release pci regions\n");
 	pci_release_regions(pdev);
 	pci_set_drvdata(pdev, NULL);
-	PCIE_INFO("disable pci device\n");
 	pci_disable_device(pdev);
-	PCIE_INFO("remove loopcheck\n");
 	skw_pcie_remove_loopcheck_thread(5);
-	PCIE_INFO("[-]\n");
+	PCIE_DBG("[-]\n");
 }
 
 int get_service_busy_sts(void)
@@ -481,9 +329,6 @@ static int skw_ep_suspend(struct device *dev)
 	u8 pba_bir;
 	u32 val;
 #endif
-#ifndef CONFIG_BT_SEEKWAVE
-	int i;
-#endif
 
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct wcn_pcie_info *priv = pci_get_drvdata(pdev);
@@ -508,12 +353,6 @@ static int skw_ep_suspend(struct device *dev)
 		skw_edma_restore();
 		goto busy;
 	}
-
-#ifndef CONFIG_BT_SEEKWAVE
-	/* clr bt host dst node */
-	for (i = EDMA_BTACL_PORT; i < EDMA_LOG_PORT+1; i+=2)
-		skw_pcie_write32(DMA_NODE_TOT_CNT(i), 0x80000000);
-#endif
 #ifndef SWT6652_V2
 	/* close L1sub */
 		/* disable L1SS */
@@ -690,34 +529,13 @@ int skw_pcie_host_irq_init(unsigned int irq_gpio_num)
 void skw_pcie_rescan_bus(void)
 {
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	struct pci_bus	*pbus = priv->dev->bus;
-	unsigned long timeout = jiffies + msecs_to_jiffies(2000); //timeout 2s
-	int timeout_occurred = 0;
 
 	PCIE_INFO("[+]\n");
-	while (port_sta_rec[EDMA_BTCMD_PORT] != 0 || port_sta_rec[EDMA_BTACL_PORT] != 0 || \
-			port_sta_rec[EDMA_BTAUDIO_PORT] != 0 || port_sta_rec[EDMA_ISOC_PORT] != 0) {
-		if (time_after(jiffies, timeout)) {
-			PCIE_ERR("BT close timeout 2s\n");
-			timeout_occurred = 1;
-			break;
-		}
-		barrier();
-	}
-	if (!timeout_occurred)
-		PCIE_INFO("bt closed\n");
 	pci_stop_and_remove_bus_device_locked(priv->dev);
 	PCIE_INFO("\n");
 	pci_lock_rescan_remove();
-	//PCIE_INFO("recv:----chipen_gpio=%d,(%d,%s)\n", priv->chip_en, read, buffer);
-	gpio_set_value(priv->chip_en, 0);
-	PCIE_INFO("recv:----chipen=%d\n", gpio_get_value(priv->chip_en));
-	msleep(50);
-	gpio_set_value(priv->chip_en, 1);
-	PCIE_INFO("recv:----chipen=%d\n", gpio_get_value(priv->chip_en));
-	msleep(100);
 	PCIE_INFO("\n");
-	pci_rescan_bus(pbus);
+	pci_rescan_bus(priv->dev->bus);
 	PCIE_INFO("\n");
 	pci_unlock_rescan_remove();
 	PCIE_INFO("\n");
@@ -727,7 +545,7 @@ void skw_pcie_rescan_bus(void)
 void skw_pcie_recovery_work(struct work_struct *work)
 {
 	int ret;
-	//struct wcn_pcie_info *priv = get_pcie_device_info();
+	struct wcn_pcie_info *priv = get_pcie_device_info();
 
 	skw_pcie_rescan_bus();
 
@@ -736,12 +554,13 @@ void skw_pcie_recovery_work(struct work_struct *work)
 		PCIE_ERR("CP RESET fail \n");
 		return;
 	}
-	//skw_pcie_bind_wifi_driver(priv->dev);
+	skw_pcie_bind_wifi_driver(priv->dev);
 	PCIE_INFO("SKW PCIe Recovery ok\n");
 }
 
 int check_chipid(void)
 {
+	int ret=0;
 	unsigned int tmp_chipid0;
 	unsigned int tmp_chipid1;
 	unsigned int tmp_chipid2;
@@ -752,11 +571,25 @@ int check_chipid(void)
 	tmp_chipid1 =  skw_pcie_read32(SKW_CHIP_ID1);
 	tmp_chipid2 =  skw_pcie_read32(SKW_CHIP_ID2);
 	tmp_chipid3 =  skw_pcie_read32(SKW_CHIP_ID3);
+	if (tmp_chipid0 ==0x33365653 && tmp_chipid1==0x3631) {
+		//sprintf((char *)priv->chip_id, "%s", "SV6316");
+		memcpy(&priv->chip_id, &tmp_chipid0,4);
+		memcpy(&priv->chip_id[1], &tmp_chipid1,4);
+		memcpy(&priv->chip_id[2], &tmp_chipid2,4);
+		memcpy(&priv->chip_id[3], &tmp_chipid3,4);
+		print_hex_dump(KERN_ERR, "CHIP ID: ", 0, 16, 1,priv->chip_id, 32, 1);
+	} else {
+		PCIE_ERR("Wrong Chip ID:%s,%s\n",(char *)&tmp_chipid0,(char *)&tmp_chipid1);
+		return -1;
+	}
 
-	memcpy(&priv->chip_id, &tmp_chipid0,4);
-	memcpy(&priv->chip_id[1], &tmp_chipid1,4);
-	memcpy(&priv->chip_id[2], &tmp_chipid2,4);
-	memcpy(&priv->chip_id[3], &tmp_chipid3,4);
+	if (ret<0) {
+		skw_pcie_err("Get Chip ID fail!\n");
+		return ret;
+	}
+    if (!strncmp((char *)priv->chip_id, "SV6316", 6)){
+            PCIE_INFO("Chip ID:%s\n", (char *)priv->chip_id);
+    }
 
 	PCIE_INFO("Chip ID:%s\n", (char *)priv->chip_id);
 	return 0;
@@ -767,12 +600,15 @@ static int skw_pcie_legacy_int_init(struct pci_dev *pdev)
 	int ret = 0;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
 
-	ret = request_irq(priv->irq, &pcie_legacy_irq, IRQF_SHARED, DRV_NAME, priv);
+	ret = request_irq(priv->irq,
+			(irq_handler_t) (&pcie_legacy_irq),
+			IRQF_SHARED,
+			DRV_NAME, (void *)priv);
 	if (ret) {
 		PCIE_ERR("request_irq(%d), error %d\n", priv->irq, ret);
 		return -1;
 	}
-	PCIE_INFO("request_irq(%d) ok\n", priv->irq);
+	PCIE_DBG("request_irq(%d) ok\n", priv->irq);
 
 	return ret;
 }
@@ -807,7 +643,7 @@ static int skw_pcie_msi_int_init(struct pci_dev *pdev)
 				priv->irq + i, ret);
 			break;
 		}
-		PCIE_INFO("request_irq(%d) ok\n", priv->irq + i);
+		PCIE_DBG("request_irq(%d) ok\n", priv->irq + i);
 	}
 #else /* CONFIG_SKW_MSI_AS_LEGACY */
 #if defined(IRQF_SHARED)
@@ -816,7 +652,6 @@ static int skw_pcie_msi_int_init(struct pci_dev *pdev)
 #else /* IRQF_SHARED */
 	ret = request_irq(pdev->irq, (irq_handler_t) (&pcie_legacy_irq), SA_SHIRQ, DRV_NAME, priv);
 #endif /* IRQF_SHARED */
-	PCIE_INFO("request_irq(%d) ok\n", pdev->irq);
 #endif /* CONFIG_SKW_MSI_AS_LEGACY */
 
 err_out:
@@ -825,9 +660,7 @@ err_out:
 
 static int skw_pcie_msix_int_init(struct pci_dev *pdev)
 {
-	int ret = 0;
-#ifdef CONFIG_MSIX_SUPPORT
-	int i;
+	int ret = 0, i;
 	int vectors;
 	struct wcn_pcie_info *priv = get_pcie_device_info();
 
@@ -835,7 +668,6 @@ static int skw_pcie_msix_int_init(struct pci_dev *pdev)
 	PCIE_DBG("vectors=0x%x\n", vectors);
 	priv->msix = kzalloc((sizeof(struct msix_entry) * vectors), GFP_KERNEL);
 	if (!priv->msix) {
-		PCIE_ERR("failed to allocate msi-x vectors!\n");
 		ret = -ENOMEM;
 		goto err_out;
 	}
@@ -861,21 +693,18 @@ static int skw_pcie_msix_int_init(struct pci_dev *pdev)
 				priv->msix[i].vector, ret);
 			break;
 		}
-		PCIE_INFO("request_irq(%d) ok\n", priv->msix[i].vector);
+		PCIE_DBG("request_irq(%d) ok\n", priv->msix[i].vector);
 	}
 err_out:
-#endif /* CONFIG_MSIX_SUPPORT */
 	return ret;
 }
 
 static int skw_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *pci_id)
 {
 	struct wcn_pcie_info *priv = get_pcie_device_info();
-	unsigned long dump_len, mem_len, aux_len;
-	u64 mem_barl = 0, mem_barh = 0;
+	unsigned long mem_len, aux_len;
 	int ret = -ENODEV;
-	struct platform_device *boot_dev=NULL;
-	//int val;
+	int val;
 
 	PCIE_INFO("[+]\n");
 	priv->dev = pdev;
@@ -885,68 +714,30 @@ static int skw_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *pci_
 		PCIE_ERR("cannot enable device:%s\n", pci_name(pdev));
 		goto err_out;
 	}
-
-#ifdef CONFIG_40BIT_DMA
-	if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(40))) {
-		PCIE_DBG("40bit DMA mask set\n");
-		if (dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(40))) {
-			PCIE_ERR("40bit coherent DMA mask set failed\n");
-			goto err_out;
-		}
-	}
-#else
-	if (!dma_set_mask(&pdev->dev, DMA_BIT_MASK(32))) {
-		PCIE_DBG("32bit DMA mask set\n");
-		if (dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(32))) {
-			PCIE_ERR("32bit coherent DMA mask set failed\n");
-			goto err_out;
-		}
-	}
-#endif
 	pci_set_master(pdev);
 	ret = pci_request_regions(pdev, DRV_NAME);
 	if (ret) {
-		PCIE_ERR("Failed to request pci memory regions\n");
 		goto err_out;
 	}
 
-	priv->dump_start = pci_resource_start(pdev, 4);
-	dump_len = pci_resource_len(pdev, 4);
 	priv->mem_start = pci_resource_start(pdev, 2);
 	mem_len = pci_resource_len(pdev, 2);
 	priv->aux_start = pci_resource_start(pdev, 0);
 	aux_len = pci_resource_len(pdev, 0);
-
-	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_2, (u32 *)&mem_barl);
-	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_3, (u32 *)&mem_barh);
-	priv->mem_pciaddr = ((mem_barh << 32) | mem_barl) & ~0xf;
+	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_2, (u32 *)&priv->mem_barl);
+	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_3, (u32 *)&priv->mem_barh);
+	priv->mem_pciaddr = ((priv->mem_barh << 32) | priv->mem_barl) & ~0xf;
 	PCIE_INFO("mem_pciaddr:0x%llx\n", priv->mem_pciaddr);
 
-	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_4, (u32 *)&mem_barl);
-	pci_read_config_dword(pdev, PCI_BASE_ADDRESS_5, (u32 *)&mem_barh);
-	priv->dump_pciaddr = ((mem_barh << 32) | mem_barl) & ~0xf;
-	PCIE_INFO("dump_pciaddr:0x%llx\n", priv->dump_pciaddr);
-
-	priv->pcidump = ioremap(priv->dump_start, dump_len);
-	//priv->pcimem = pci_iomap(pdev, 2, mem_len);
-	if (!priv->pcidump) {
-		PCIE_ERR("%s:Couldn't map region %x[%x]",
-			pci_name(pdev), (int)priv->dump_start, (int)dump_len);
-		ret = -1;
-		goto free_region;
-	}
-
 	priv->pcimem = ioremap(priv->mem_start, mem_len);
-	//priv->pcimem = pci_iomap(pdev, 2, mem_len);
 	if (!priv->pcimem) {
 		PCIE_ERR("%s:Couldn't map region %x[%x]",
 			pci_name(pdev), (int)priv->mem_start, (int)mem_len);
 		ret = -1;
-		goto free_memmap0;
+		goto free_region;
 	}
 
 	priv->pciaux = ioremap(priv->aux_start, aux_len);
-	//priv->pciaux = pci_iomap(pdev, 0, aux_len);
 	if (!priv->pciaux) {
 		PCIE_ERR("%s:Couldn't map region %x[%x]",
 			pci_name(pdev), (int)priv->aux_start, (int)aux_len);
@@ -955,7 +746,6 @@ static int skw_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *pci_
 	}
 	PCIE_INFO("BAR(0)(auxmem) (0x%llx 0x%lx)\n", priv->aux_start, aux_len);
 	PCIE_INFO("BAR(2)(mem)   [0x%llx 0x%lx)\n", priv->mem_start, mem_len);
-	PCIE_INFO("BAR(4)(dump)   [0x%llx 0x%lx)\n", priv->dump_start, dump_len);
 
 	priv->irq = pdev->irq;
 	if (pcie_int == 1)
@@ -984,34 +774,25 @@ static int skw_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *pci_
 		if (ret)
 			goto free_memmap2;
 	}
-	PCIE_INFO("pcie init ok");
+
 	device_wakeup_enable(&(pdev->dev));
 	ep_address_mapping(priv);
 	skw_edma_init();
-	PCIE_INFO("skw_edma_init ok");
+	init_completion(&priv->download_done);
 	check_chipid();
-	if(priv->cp_state == CP_READY) {
-		init_completion(&priv->download_done);
-		init_completion(&priv->edma_blk_dl_done);
-	}
-	skw_pcie_bind_platform_driver(boot_dev);
-	//skw_pcie_create_loopcheck_thread(5);
-#if 0
-	if(priv->cp_state != CP_READY)
+	init_completion(&priv->edma_blk_dl_done);
+	skw_pcie_bind_platform_driver(pdev);
+	skw_pcie_create_loopcheck_thread(5);
+	if(priv->cp_state)
 		skw_pcie_bind_bt_driver(priv->dev);
-#endif
+
 	priv->service_state_map = 0;
 	PCIE_INFO("ok\n");
-#if 0
 	/* fix debug boot issue */
 	val = skw_pcie_read32(0x40100030);
 	val &= ~0xff00;
 	val |= 0x5a00;
 	skw_pcie_write32(0x40100030, val);
-#endif
-	if(priv->cp_state == CP_READY) {
-		seekwave_boot_init();
-	}
 	return 0;
 
 
@@ -1019,8 +800,6 @@ free_memmap2:
 	iounmap(priv->pciaux);
 free_memmap1:
 	iounmap(priv->pcimem);
-free_memmap0:
-	iounmap(priv->pcidump);
 free_region:
 	pci_release_regions(pdev);
 err_out:
@@ -1037,8 +816,6 @@ const struct dev_pm_ops skw_ep_pm_ops = {
 static struct pci_device_id skw_pcie_tbl[] = {
 	{PCI_DEVICE(0x0043, 0x834d)},
 	{PCI_DEVICE(0x1FFE, 0x6316)},
-	{PCI_DEVICE(0x3FFF, 0x6316)},//XXX
-	{PCI_DEVICE(0x1FFE, 0x6315)},
 	{}
 };
 MODULE_DEVICE_TABLE(pci, skw_pcie_tbl);
@@ -1070,9 +847,10 @@ static int __init skw_pcie_init(void)
 	INIT_DELAYED_WORK(&priv->skw_pcie_recovery_work, skw_pcie_recovery_work);
 	INIT_DELAYED_WORK(&priv->skw_except_work, skw_pcie_exception_work);
 	INIT_DELAYED_WORK(&priv->check_dumpdone_work, check_dumpdone_work);
-	INIT_DELAYED_WORK(&priv->dump_mem_work, dump_mem_work);
 	ret = pci_register_driver(&skw_pcie_driver);
-	if(ret)
+	if(!ret)
+		seekwave_boot_init();
+	else
 		PCIE_ERR("pci_register_driver fail %d\n", ret);
 	mutex_init(&priv->except_mutex);
 	mutex_init(&priv->dl_lock);
@@ -1087,21 +865,15 @@ static void __exit skw_pcie_exit(void)
 
 	PCIE_INFO("[+]\n");
 	seekwave_boot_exit();
-	skw_pcie_debugfs_deinit();
 	mutex_destroy(&priv->except_mutex);
 	mutex_destroy(&priv->dl_lock);
-	mutex_destroy(&priv->close_mutex);
 	pci_unregister_driver(&skw_pcie_driver);
 	cancel_delayed_work_sync(&priv->skw_except_work);
 	cancel_delayed_work_sync(&priv->skw_pcie_recovery_work);
 	cancel_delayed_work_sync(&priv->check_dumpdone_work);
-	cancel_delayed_work_sync(&priv->dump_mem_work);
-	if (priv->chip_en >= 0) {
-		gpio_set_value(priv->chip_en,0);
-		msleep(50);
-		gpio_set_value(priv->chip_en, 1);
-	} else
-		PCIE_ERR("chip_en is not configured, check \"MODEM_ENABLE_GPIO\" in boot_config.h!!!");
+	gpio_set_value(priv->chip_en,0);
+	msleep(20);
+	gpio_set_value(priv->chip_en, 1);
 	msleep(100);
 	skw_pcie_rescan_bus();
 	kfree(priv);

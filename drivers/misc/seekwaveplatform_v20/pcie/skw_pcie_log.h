@@ -74,10 +74,8 @@ unsigned long skw_pcie_log_level(void);
 	} while (0)
 
 #endif
-int get_log_enable_status(void);
+int skw_pcie_cp_log_status(void);
 void skw_pcie_log_level_init(void);
 int skw_pcie_cp_log(int disable);
-int skw_pcie_debug_log_open(void);
-int skw_pcie_debug_log_close(void);
 #endif
 

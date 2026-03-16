@@ -36,7 +36,7 @@
 #define PORT_TO_EDMA_RX_CHANNEL(x)     (x>=EDMA_LOG_PORT? ((x-EDMA_LOG_PORT)*2+28): BASE_EDMA_CH + x * 2 + 1)
 #define EDMACH2PORTNO(x)               ((x>=BASE_EDMA_CH_EXT)?(((x-BASE_EDMA_CH_EXT)>>1)+EDMA_LOG_PORT):(x - BASE_EDMA_CH)>> 1)
 
-#define EDMA_PORT_BUFFER_SIZE 2048
+#define EDMA_PORT_BUFFER_SIZE 512
 
 #define PORT_STATE_IDLE	0
 #define PORT_STATE_OPEN	1
@@ -68,19 +68,15 @@ typedef union  EDMA_ADDR_U {
 
 struct edma_chn_info {
 	struct skw_channel_cfg chn_cfg;
-	//u32 n_pld_sz;
+	u32 n_pld_sz;
 	u32 chn_id;
-	//void *p_link_hdr;
-	//dma_addr_t dma_hdr_handle;
+	void *p_link_hdr;
+	dma_addr_t dma_hdr_handle;
 	void *rcv_header_cpu_addr;
 	void *rcv_tail_cpu_addr;
-	//dma_addr_t map_hdr_addr;
-	//dma_addr_t map_pld_addr;
-	//dma_addr_t map_skb_addr;
-	dma_addr_t pld_dma_addr;
-	void *pld_virt_addr;
-	dma_addr_t hdr_dma_addr;
-	void *hdr_virt_addr;
+	dma_addr_t map_hdr_addr;
+	dma_addr_t map_pld_addr;
+	dma_addr_t map_skb_addr;
 };
 
 struct edma_port {
@@ -99,16 +95,12 @@ struct edma_port {
 	u16 tx_size;
 	char *rx_buf_addr;
 	rx_submit_fn rx_submit;
-	struct task_struct *thread;
-	struct semaphore sem;
 	void *rx_data;
 	int	state;
 	struct completion rx_done;
 	struct completion tx_done;
 	struct mutex rx_mutex;
-	u8 rx_int_done;
 };
-extern u32 port_sta_rec[32];
 
 extern void edma_init(void);
 extern void EDMA_IRQPolling(void);
@@ -118,11 +110,11 @@ void skw_edma_deinit(void);
 int msi_edma_channel_irq_handler(int irq_num);
 int legacy_edma_irq_handle(void);
 int msi_irq_wifi_takeover_handler(int irq_num);
-int skw_pcie_bind_wifi_driver(struct platform_device *boot_dev);
-int skw_pcie_bind_platform_driver(struct platform_device *boot_dev);
-int skw_pcie_bind_bt_driver(struct platform_device *boot_dev);
-int skw_pcie_unbind_wifi_driver(struct platform_device *boot_dev);
-int skw_pcie_unbind_bt_driver(struct platform_device *boot_dev);
+int skw_pcie_bind_wifi_driver(struct pci_dev *pci_dev);
+int skw_pcie_bind_platform_driver(struct pci_dev *pci_dev);
+int skw_pcie_bind_bt_driver(struct pci_dev *dev);
+int skw_pcie_unbind_wifi_driver(struct pci_dev *dev);
+int skw_pcie_unbind_bt_driver(struct pci_dev *dev);
 int edma_channel_init(int ch_id, void *channel_config, void *data);
 int edma_adma_send(int ch_id, struct scatterlist *sg, int node_cnt, int size);
 int submit_list_to_edma_channel(int ch_id, u64 header, int count);

@@ -14,7 +14,6 @@
 #ifndef __SKW_PCIE_DRV_H__
 #define __SKW_PCIE_DRV_H__
 
-#include "asm-generic/int-ll64.h"
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include "../skwutil/skw_boot.h"
@@ -37,10 +36,8 @@
 #define SKWPCIE_AP2CP_SIG0	(0xF80+0x10)
 #define SKWPCIE_AP2CP_SIG1	(0xF80+0x14)
 #define SKWPCIE_AP2CP_SIG2	(0xF80+0x18)
-#define SKWPCIE_CP2AP_SIG0	(0xF80+0x1C)
 
-#define PCIE_MISC_CTRL_0 (0xF80+0x10)
-#define PCIE_MISC_STATUS_0 (0xF80+0x20)
+#define SKWPCIE_CP2AP_SIG0	(0xF80+0x1C)
 
 #define SKW_CHIP_ID0	0x40000000	//SV6160 chip id0
 #define SKW_CHIP_ID1	0x40000004	//SV6160 chip id1
@@ -61,8 +58,6 @@
 #define IBREG3_OFFSET_ADDR	(0x1000 + (3 * 0x20))
 #define OBREG0_OFFSET_ADDR	(0x1000 + (4 * 0x20))
 #define OBREG1_OFFSET_ADDR	(0x1000 + (5 * 0x20))
-#define IBREG4_OFFSET_ADDR	(0x1000 + (6 * 0x20))
-#define IBREG5_OFFSET_ADDR	(0x1000 + (7 * 0x20))
 
 #define FW_DATA_CRC_BASE	0x401EFFE4
 #define FW_BOOT_REG_BASE	0x40000144
@@ -84,36 +79,11 @@ struct dma_buf {
 	int size;
 };
 
-typedef enum {
-	CP_READY = 0,
-	CP_ASSERT,
-	CP_DUMPDONE,
-	CP_BLOCK,
-} cp_status_t;
-
-typedef enum {
-	WIFI_START = 0,
-	WIFI_STOP,
-	BT_START,
-	BT_STOP
-} svc_op_t;
-
-typedef union {
-	u32 reg_val;
-	struct {
-		u32 rsv:16;
-		u32 signals_sel:8;
-		u32 sys_sel:7;
-		u32 enable:1;
-	};
-} __attribute__((packed)) pcie_misc_ctrl_0_t;
-
 struct wcn_pcie_info {
 	struct platform_device *rc_pd;
 	struct pci_dev *dev;
 	struct pci_saved_state *saved_state;
 	u64 mem_pciaddr;
-	u64 dump_pciaddr;
 	int legacy_en;
 	int msi_en;
 	int msix_en;
@@ -122,17 +92,16 @@ struct wcn_pcie_info {
 	int irq_num;
 	int gpio_irq_num;
 	int bar_num;
-	u8 __iomem *pcidump;
 	u8 __iomem *pcimem;
 	u8 __iomem *pciaux;
 	u64 mem_start;
-	u64 dump_start;
 	u64 aux_start;
+	u64 mem_barl;
+	u64 mem_barh;
 	struct msix_entry *msix;
 	spinlock_t *spin_lock;
 	struct mutex except_mutex;
 	struct mutex dl_lock;
-	struct mutex close_mutex;
 	u32 iram_dl_size;
 	u32 dram_dl_size;
 	u32 iram_crc_offset;
@@ -145,7 +114,7 @@ struct wcn_pcie_info {
 	atomic_t irq_cnt;
 	struct completion download_done;
 	struct completion edma_blk_dl_done;
-	cp_status_t cp_state;
+	int cp_state;
 	int chip_en;
 	int recovery_dis_state;
 	unsigned int chip_id[SKW_CHIP_ID_LENGTH];
@@ -154,7 +123,6 @@ struct wcn_pcie_info {
 	struct delayed_work skw_except_work;
 	struct delayed_work skw_pcie_recovery_work;
 	struct delayed_work check_dumpdone_work;
-	struct delayed_work dump_mem_work;
 #ifdef CONFIG_BT_SEEKWAVE
 	struct work_struct bt_rx_work;
 #endif
@@ -165,11 +133,8 @@ struct wcn_pcie_info {
 	struct wake_lock wake_lock;
 	struct wake_lock wake_lockevent;
 #endif
-	svc_op_t svc_op;
 };
 
-extern char *str_cpsts[];
-extern int cp_boot;
 struct wcn_pcie_info *get_pcie_device_info(void);
 //char *pcie_bar_vmem(struct wcn_pcie_info *priv, int bar);
 int pcie_config_read(struct wcn_pcie_info *priv, int offset, char *buf, int len);
@@ -191,10 +156,4 @@ int skw_pcie_recovery_debug_status(void);
 int skw_pcie_recovery_disable(int disable);
 void reboot_to_change_bt_uart1(char *mode);
 int skw_pcie_host_irq_init(unsigned int irq_gpio_num);
-int skw_pcie_mem_dump(unsigned int system_addr, void *buf,unsigned int len);
-void modem_notify_event(int event);
-int skw_pcie_cp_log(int disable);
-void skw_pcie_swdump(void);
-ssize_t skw_pcie_swd_read(char __user *buffer, size_t length, loff_t *offset);
-void dump_mem_work(struct work_struct *work);
 #endif

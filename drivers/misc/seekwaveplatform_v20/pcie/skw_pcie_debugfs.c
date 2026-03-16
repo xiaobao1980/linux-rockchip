@@ -12,115 +12,49 @@
 #include "skw_pcie_log.h"
 #include "skw_pcie_drv.h"
 
-static struct proc_dir_entry *skw_pcie_proc_root;
+static struct dentry *skw_pcie_root_dir;
 
-static int skw_pcie_proc_show(struct seq_file *seq, void *v)
+static ssize_t skw_pcie_default_read(struct file *fp, char __user *buf, size_t len,
+				loff_t *offset)
 {
-#define SKW_BSP_CONFIG_INT(conf)                                               \
-	do {                                                                   \
-		seq_printf(seq, "%s=%d\n", #conf, conf);                       \
-	} while (0)
-
-#define SKW_BSP_CONFIG_BOOL(conf)                                              \
-	do {                                                                   \
-		if (IS_ENABLED(conf))                                          \
-			seq_printf(seq, "%s=y\n", #conf);                      \
-		else                                                           \
-			seq_printf(seq, "# %s is not set\n", #conf);           \
-	} while (0)
-
-#define SKW_BSP_CONFIG_STRING(conf)                                            \
-	do {                                                                   \
-		seq_printf(seq, "%s=\"%s\"\n", #conf, conf);                   \
-	} while (0)
-
-	seq_puts(seq, "\n");
-	seq_printf(seq, "Kernel Version:  \t%s\n", UTS_RELEASE);
-	seq_puts(seq, "\n");
-
-	SKW_BSP_CONFIG_BOOL(CONFIG_SKW_PCIE);
-	SKW_BSP_CONFIG_BOOL(CONFIG_SEEKWAVE_BSP_DRIVERS);
-	SKW_BSP_CONFIG_BOOL(CONFIG_SKW_BSP_UCOM);
-	SKW_BSP_CONFIG_BOOL(CONFIG_SKW_BSP_BOOT);
-	SKW_BSP_CONFIG_BOOL(CONFIG_SEEKWAVE_PLD_RELEASE);
-#ifdef CONFIG_SKW6316_RX_REORDER_TIMEOUT
-	SKW_BSP_CONFIG_INT(CONFIG_SKW6316_RX_REORDER_TIMEOUT);
-#endif
-#ifdef CONFIG_SKW6316_CHIP_ID
-	SKW_BSP_CONFIG_STRING(CONFIG_SKW6316_CHIP_ID);
-#endif
-	seq_puts(seq, "\n");
-
 	return 0;
 }
 
-static int skw_pcie_proc_open(struct inode *inode, struct file *file)
+static ssize_t skw_pcie_state_write(struct file *fp, const char __user *buffer,
+				size_t len, loff_t *offset)
 {
-	return single_open(file, skw_pcie_proc_show, NULL);
+	return len;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops skw_pcie_proc_fops = {
-	.proc_open = skw_pcie_proc_open,
-	.proc_read = seq_read,
-	.proc_release = single_release,
+static const struct file_operations skw_pcie_state_fops = {
+	.open = skw_pcie_default_open,
+	.read = skw_pcie_default_read,
+	.write = skw_pcie_state_write,
 };
-#else
-static const struct file_operations skw_pcie_proc_fops = {
-	.owner = THIS_MODULE,
-	.open = skw_pcie_proc_open,
-	.read = seq_read,
-	.release = single_release,
-};
-#endif
 
-struct proc_dir_entry *skw_pcie_procfs_file(struct proc_dir_entry *parent,
-					    const char *name, umode_t mode,
-					    const void *fops, void *data)
+struct dentry *skw_pcie_add_debugfs(const char *name, umode_t mode, void *data,
+				   const struct file_operations *fops)
 {
-	struct proc_dir_entry *dentry = parent ? parent : skw_pcie_proc_root;
+	skw_pcie_dbg("%s:name: %s\n",__func__,name);
 
-	if (!dentry)
-		return NULL;
-
-	return proc_create_data(name, mode, dentry, fops, data);
-}
-
-int skw_pcie_proc_init(void)
-{
-	skw_pcie_proc_root = proc_mkdir("skwpcie", NULL);
-	if (!skw_pcie_proc_root) {
-		pr_err("creat proc skwpcie failed\n");
-		return -1;
-	}
-	skw_pcie_procfs_file(skw_pcie_proc_root, "profile", 0,
-			     &skw_pcie_proc_fops, NULL);
-	return 0;
-}
-
-int skw_pcie_proc_init_ex(const char *name, umode_t mode, const void *fops,
-			  void *data)
-{
-	if (!skw_pcie_proc_root)
-		return -1;
-	skw_pcie_procfs_file(skw_pcie_proc_root, name, mode, fops, NULL);
-	return 0;
-}
-void skw_pcie_proc_deinit(void)
-{
-	if (!skw_pcie_proc_root)
-		return;
-	proc_remove(skw_pcie_proc_root);
+	return debugfs_create_file(name, mode, skw_pcie_root_dir, data, fops);
 }
 
 int skw_pcie_debugfs_init(void)
 {
-	skw_pcie_proc_init();
+	skw_pcie_root_dir = debugfs_create_dir("skwpcie", NULL);
+	if (IS_ERR(skw_pcie_root_dir))
+		return PTR_ERR(skw_pcie_root_dir);
+
+	// skw_pcie_add_debugfs("state", 0666, wiphy, &skw_pcie_state_fops);
+	// skw_pcie_add_debugfs("log_level", 0444, wiphy, &skw_pcie_log_fops);
+
 	return 0;
 }
 
 void skw_pcie_debugfs_deinit(void)
 {
 	skw_pcie_dbg("%s :traced\n", __func__);
-	skw_pcie_proc_deinit();
+
+	debugfs_remove_recursive(skw_pcie_root_dir);
 }

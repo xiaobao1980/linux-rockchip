@@ -54,7 +54,7 @@ static int skw_usb_log_show(struct seq_file *seq, void *data)
 
 	int i;
 	u32 level = skw_usb_log_level();
-	u8 *log_name[] = { "NONE", "ERROR", "WARNNING", "INFO", "DEBUG" };
+	u8 *log_name[] = {"NONE", "ERROR", "WARNNING", "INFO", "DEBUG"};
 
 	for (i = 0; i < 5; i++) {
 		if (!(level & BIT(i)))
@@ -100,11 +100,11 @@ static int skw_usb_log_control(const char *cmd, bool enable)
 		skw_usb_enable_func_log(SKW_USB_PORT4, enable);
 	else if (!strcmp("port5", cmd))
 		skw_usb_enable_func_log(SKW_USB_PORT5, enable);
-	else if (!strcmp("port6", cmd))
+    else if (!strcmp("port6", cmd))
 		skw_usb_enable_func_log(SKW_USB_PORT6, enable);
 	else if (!strcmp("port7", cmd))
 		skw_usb_enable_func_log(SKW_USB_PORT7, enable);
-	else if (!strcmp("savelog", cmd))
+    else if (!strcmp("savelog", cmd))
 		skw_usb_enable_func_log(SKW_USB_SAVELOG, enable);
 	else if (!strcmp("debug", cmd))
 		skw_usb_set_log_level(SKW_USB_DEBUG);
@@ -121,7 +121,7 @@ static int skw_usb_log_control(const char *cmd, bool enable)
 }
 
 static ssize_t skw_usb_log_write(struct file *fp, const char __user *buffer,
-				 size_t len, loff_t *offset)
+				size_t len, loff_t *offset)
 {
 	int i, idx;
 	char cmd[32];
@@ -168,14 +168,6 @@ static ssize_t skw_usb_log_write(struct file *fp, const char __user *buffer,
 	return len;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops skw_usb_log_fops = {
-	.proc_open = skw_usb_log_open,
-	.proc_read = seq_read,
-	.proc_release = single_release,
-	.proc_write = skw_usb_log_write,
-};
-#else
 static const struct file_operations skw_usb_log_fops = {
 	.owner = THIS_MODULE,
 	.open = skw_usb_log_open,
@@ -183,10 +175,10 @@ static const struct file_operations skw_usb_log_fops = {
 	.release = single_release,
 	.write = skw_usb_log_write,
 };
-#endif
+
 static int skw_version_show(struct seq_file *seq, void *data)
 {
-	seq_printf(seq, "firmware info:\n %s\n", firmware_version);
+	seq_printf(seq, "firmware info:\n %s\n", firmware_version );
 	return 0;
 }
 
@@ -195,99 +187,225 @@ static int skw_version_open(struct inode *inode, struct file *file)
 	return single_open(file, &skw_version_show, inode->i_private);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops skw_version_fops = {
-	.proc_open = skw_version_open,
-	.proc_read = seq_read,
-	.proc_release = single_release,
-};
-#else
+
 static const struct file_operations skw_version_fops = {
-	.owner = THIS_MODULE,
-	.open = skw_version_open,
-	.read = seq_read,
-	.release = single_release,
+        .owner = THIS_MODULE,
+        .open = skw_version_open,
+        .read = seq_read,
+        .release = single_release,
 };
-#endif
+
+
+static int skw_cp_log_show(struct seq_file *seq, void *data)
+{
+        if (!skw_usb_cp_log_status())
+                seq_printf(seq, "Enabled");
+        else
+                seq_printf(seq, "Disabled");
+        return 0;
+}
+static int skw_cp_log_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, &skw_cp_log_show, inode->i_private);
+}
+
+
+static ssize_t skw_cp_log_write(struct file *fp, const char __user *buffer,
+                                size_t len, loff_t *offset)
+{
+        char cmd[16]={0};
+
+        if (len >= sizeof(cmd))
+                return -EINVAL;
+        if (copy_from_user(cmd, buffer, len))
+                return -EFAULT;
+        if (!strncmp("enable", cmd, 6))
+                skw_usb_cp_log(0);
+        else if (!strncmp("disable", cmd, 7))
+                skw_usb_cp_log(1);
+
+        return len;
+}
+
+static const struct file_operations skw_cp_log_fops = {
+        .owner = THIS_MODULE,
+        .open = skw_cp_log_open,
+        .read = seq_read,
+        .release = single_release,
+        .write = skw_cp_log_write,
+};
 
 static int skw_port_statistic_show(struct seq_file *seq, void *data)
 {
 	char *statistic = kzalloc(2048, GFP_KERNEL);
 
 	skw_get_port_statistic(statistic, 2048);
-	seq_printf(seq, "Statistic:\n%s", statistic);
-	kfree(statistic);
+	seq_printf(seq, "Statistic:\n%s", statistic );
+       	kfree(statistic);
 	return 0;
 }
 
 static int skw_port_statistic_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, &skw_port_statistic_show, inode->i_private);
+        return single_open(file, &skw_port_statistic_show, inode->i_private);
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops skw_port_statistic_fops = {
-	.proc_open = skw_port_statistic_open,
-	.proc_read = seq_read,
-	.proc_release = single_release,
-};
-#else
 static const struct file_operations skw_port_statistic_fops = {
-	.owner = THIS_MODULE,
-	.open = skw_port_statistic_open,
-	.read = seq_read,
-	.release = single_release,
+          .owner = THIS_MODULE,
+          .open = skw_port_statistic_open,
+          .read = seq_read,
+          .release = single_release,
 };
-#endif
+static int skw_bluetooth_antenna_show(struct seq_file *seq, void *data)
+{
+        char result[32];
+
+        memset(result, 0, sizeof(result));
+        get_bt_antenna_mode(result);
+        if(strlen(result))
+                seq_printf(seq, result);
+        return 0;
+}
+static int skw_bluetooth_antenna_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, &skw_bluetooth_antenna_show, inode->i_private);
+}
+
+
+static ssize_t skw_bluetooth_antenna_write(struct file *fp, const char __user *buffer,
+                                size_t len, loff_t *offset)
+{
+        char cmd[32]={0};
+
+        if (len >= sizeof(cmd))
+                return -EINVAL;
+        if (copy_from_user(cmd, buffer, len))
+                return -EFAULT;
+        if (!strncmp("switch", cmd, 6)) {
+                memset(cmd, 0, sizeof(cmd));
+                reboot_to_change_bt_antenna_mode(cmd);
+                printk("%s\n", cmd);
+        }
+        return len;
+}
+
+static const struct file_operations skw_bluetooth_antenna_fops = {
+        .owner = THIS_MODULE,
+        .open = skw_bluetooth_antenna_open,
+        .read = seq_read,
+        .release = single_release,
+        .write = skw_bluetooth_antenna_write,
+};
+
+static int skw_USB_speed_show(struct seq_file *seq, void *data)
+{
+        char result[32];
+
+        memset(result, 0, sizeof(result));
+        get_USB_speed_mode(result);
+        if(strlen(result))
+                seq_printf(seq, result);
+        return 0;
+}
+static int skw_USB_speed_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, &skw_USB_speed_show, inode->i_private);
+}
+
+
+static ssize_t skw_USB_speed_write(struct file *fp, const char __user *buffer,
+                                size_t len, loff_t *offset)
+{
+        char cmd[32]={0};
+
+        if (len >= sizeof(cmd))
+                return -EINVAL;
+        if (copy_from_user(cmd, buffer, len))
+                return -EFAULT;
+        if (!strncmp("HIGH", cmd, 4)) {
+                memset(cmd, 0, sizeof(cmd));
+                reboot_to_change_USB_speed_mode(cmd);
+                printk("%s\n", cmd);
+        }
+        return len;
+}
+
+static const struct file_operations skw_USB_speed_fops = {
+        .owner = THIS_MODULE,
+        .open = skw_USB_speed_open,
+        .read = seq_read,
+        .release = single_release,
+        .write = skw_USB_speed_write,
+};
 
 static int skwusb_recovery_debug_show(struct seq_file *seq, void *data)
 {
-	if (skw_usb_recovery_debug_status())
-		seq_printf(seq, "Disabled");
-	else
-		seq_printf(seq, "Enabled");
+    if (skw_usb_recovery_debug_status())
+        seq_printf(seq, "Disabled");
+    else
+        seq_printf(seq, "Enabled");
 
-	return 0;
+    return 0;
 }
 static int skwusb_recovery_debug_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, &skwusb_recovery_debug_show, inode->i_private);
+        return single_open(file, &skwusb_recovery_debug_show, inode->i_private);
 }
 
-static ssize_t skwusb_recovery_debug_write(struct file *fp,
-					   const char __user *buffer,
-					   size_t len, loff_t *offset)
+static ssize_t skwusb_recovery_debug_write(struct file *fp, const char __user *buffer,
+                size_t len, loff_t *offset)
 {
-	char cmd[16] = { 0 };
+    char cmd[16]={0};
+
+    if (len >= sizeof(cmd))
+        return -EINVAL;
+    if (copy_from_user(cmd, buffer, len))
+        return -EFAULT;
+    if (!strncmp("disable", cmd, 7))
+        skw_usb_recovery_debug(1);
+    else if (!strncmp("enable", cmd, 6))
+        skw_usb_recovery_debug(0);
+
+    return len;
+}
+
+static const struct file_operations skwusb_recovery_debug_fops = {
+    .owner = THIS_MODULE,
+    .open = skwusb_recovery_debug_open,
+    .read = seq_read,
+    .release = single_release,
+    .write = skwusb_recovery_debug_write,
+};
+
+static int skw_bluetooth_UART1_open(struct inode *inode, struct file *file)
+{
+        return single_open(file, NULL, inode->i_private);
+}
+
+
+static ssize_t skw_bluetooth_UART1_write(struct file *fp, const char __user *buffer,
+				size_t len, loff_t *offset)
+{
+	char cmd[32]={0};
 
 	if (len >= sizeof(cmd))
 		return -EINVAL;
 	if (copy_from_user(cmd, buffer, len))
 		return -EFAULT;
-	if (!strncmp("disable", cmd, 7))
-		skw_usb_recovery_debug(1);
-	else if (!strncmp("enable", cmd, 6))
-		skw_usb_recovery_debug(0);
-
+	if (!strncmp("enable", cmd, 6)) {
+		memset(cmd, 0, sizeof(cmd));
+		reboot_to_change_bt_uart1(cmd);
+		printk("%s UART-HCI\n", cmd);
+	}
 	return len;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 6, 0)
-static const struct proc_ops skwusb_recovery_debug_fops = {
-	.proc_open = skwusb_recovery_debug_open,
-	.proc_read = seq_read,
-	.proc_release = single_release,
-	.proc_write = skwusb_recovery_debug_write,
-};
-#else
-static const struct file_operations skwusb_recovery_debug_fops = {
+static const struct file_operations skw_bluetooth_UART1_fops = {
 	.owner = THIS_MODULE,
-	.open = skwusb_recovery_debug_open,
-	.read = seq_read,
+	.open = skw_bluetooth_UART1_open,
 	.release = single_release,
-	.write = skwusb_recovery_debug_write,
+	.write = skw_bluetooth_UART1_write,
 };
-#endif
 
 void skw_usb_log_level_init(void)
 {
@@ -303,9 +421,12 @@ void skw_usb_log_level_init(void)
 	skw_usb_enable_func_log(SKW_USB_PORT6, false);
 	skw_usb_enable_func_log(SKW_USB_SAVELOG, false);
 	skw_usb_enable_func_log(SKW_USB_PORT7, false);
-	skw_usb_proc_init_ex("log_level", 0666, &skw_usb_log_fops, NULL);
-	skw_usb_proc_init_ex("Version", 0664, &skw_version_fops, NULL);
-	skw_usb_proc_init_ex("Statistic", 0666, &skw_port_statistic_fops, NULL);
-	skw_usb_proc_init_ex("recovery", 0666, &skwusb_recovery_debug_fops,
-			     NULL);
+	skw_usb_add_debugfs("log_level", 0666, NULL, &skw_usb_log_fops);
+	skw_usb_add_debugfs("Version", 0664, NULL, &skw_version_fops);
+	skw_usb_add_debugfs("CPLog", 0666, NULL, &skw_cp_log_fops);
+	skw_usb_add_debugfs("Statistic", 0666, NULL, &skw_port_statistic_fops);
+	skw_usb_add_debugfs("BT_ANT", 0666, NULL, &skw_bluetooth_antenna_fops);
+	skw_usb_add_debugfs("recovery", 0666, NULL, &skwusb_recovery_debug_fops);
+	skw_usb_add_debugfs("USB_SPEED", 0666, NULL, &skw_USB_speed_fops);
+	skw_usb_add_debugfs("BT_UART1", 0666, NULL, &skw_bluetooth_UART1_fops);
 }
