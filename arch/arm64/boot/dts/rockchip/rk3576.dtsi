@@ -2689,7 +2689,6 @@
 
 		nvmem-cells = <&gpu_leakage>, <&gpu_opp_info>, <&specification_serial_number>;
 		nvmem-cell-names = "leakage", "opp-info", "specification_serial_number";
-		rockchip,supported-hw;
 
 		rockchip,pvtm-hw = <0x06>;
 		rockchip,pvtm-voltage-sel-hw = <

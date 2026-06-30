@@ -24,11 +24,25 @@
 
 	/delete-node/ chosen;
 
+	adc-keys {
+		compatible = "adc-keys";
+		io-channels = <&saradc 1>;
+		io-channel-names = "buttons";
+		keyup-threshold-microvolt = <1800000>;
+		status = "okay";
+
+		volumeup-key {
+			linux,code = <KEY_VOLUMEUP>;
+			label = "volume up";
+			press-threshold-microvolt = <1750000>;
+		};
+	};
+
 	fan0: pwm-fan {
 		status = "okay";
 		compatible = "pwm-fan";
 		#cooling-cells = <2>;
-		cooling-levels = <0 50 100 150 200 255>;
+		cooling-levels = <25 45 60 75 100 130 170 210 255>;
 		fan-supply = <&vcc_sys>;
 		pwms = <&pwm0_2ch_0 0 60000 0>;
 
@@ -39,10 +53,14 @@
 		pinctrl-0 = <&fan_tach>;
 
 		rockchip,temp-trips = <
-            20000    1
-            25000    2
-            30000    3
-            35000    5
+			38000	1
+			44000	2
+			50000	3
+			56000	4
+			62000	5
+			68000	6
+			74000	7
+			80000	8
         >;
 	};
 
@@ -152,6 +170,8 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		enable-active-high;
+		regulator-boot-on;
+		regulator-always-on;
 		gpios = <&gpio0 RK_PB6 GPIO_ACTIVE_HIGH>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&sdmmc_pwr_en>;
@@ -491,7 +511,7 @@
 	no-sdio;
 	no-sd;
 	non-removable;
-	max-frequency = <200000000>;
+	max-frequency = <100000000>;
 	mmc-hs400-1_8v;
 	mmc-hs400-enhanced-strobe;
 	full-pwr-cycle-in-suspend;
@@ -529,6 +549,7 @@
 &hdmi {
 	status = "okay";
 	cec-enable;
+	enable-gpios = <&gpio4 RK_PC6 GPIO_ACTIVE_HIGH>;
 	ddc-i2c-scl-high-time-ns = <4812>;
 	ddc-i2c-scl-low-time-ns = <5000>;
 };
@@ -669,7 +690,7 @@
 };
 
 &sdmmc {
-        max-frequency = <200000000>;
+        max-frequency = <100000000>;
         pinctrl-0 = <&sdmmc0_clk &sdmmc0_cmd &sdmmc0_det &sdmmc0_bus4>;
         pinctrl-names = "default";
         no-sdio;
@@ -741,7 +762,7 @@
 		interrupt-controller;
 		gpio-line-names =
 		"MIPI_DPHY_CSI0_IO1"	,"USB_USB30_PWREN_H",
-		"USB_HOST_PWREN_H"	,"PCIe_SX1261_RST_3V3",
+		"USB_HOST_PWREN_H"	,"BRD_ID_WP",
 		"LTE_RESET"	,"P05",
 		"P06"	,"LoRaWan_sx1262_CS",
 		"USER_LED_R"	,"USER_LED_B",
@@ -753,12 +774,12 @@
 	};
 
 
-	// eeprom:	at24c256@57 {
-	// 	status = "okay";
-	// 	compatible = "atmel,24c256";
-	// 	reg = <0x57>;
-	// 	pagesize = <16>;
-	// };
+	eeprom:	at24c256@57 {
+		status = "okay";
+		compatible = "atmel,24c256";
+		reg = <0x57>;
+		pagesize = <16>;
+	};
 
 	pcf8563: pcf8563@51 {
 		compatible = "nxp,pcf8563";
